@@ -22,10 +22,10 @@ const maxMsgSize = 200 * 1024 * 1024 // 200 MB
 
 // Clients bundles all gRPC service clients used by Tassilo.
 type Clients struct {
-	conn        *grpc.ClientConn
-	LN          lnrpc.LightningClient
-	Tap         taprpc.TaprootAssetsClient
-	TapChannel  tapchannelrpc.TaprootAssetChannelsClient
+	conn          *grpc.ClientConn
+	LN            lnrpc.LightningClient
+	Tap           taprpc.TaprootAssetsClient
+	TapChannel    tapchannelrpc.TaprootAssetChannelsClient
 	superMacaroon string
 }
 
