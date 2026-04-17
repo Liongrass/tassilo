@@ -3,8 +3,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -42,7 +45,44 @@ func Run(clients *client.Clients) error {
 	a.tapp.SetRoot(a.pages, true).EnableMouse(true)
 	a.showDashboard()
 
-	return a.tapp.Run()
+	// Ctrl+L forces a full redraw on any screen.
+	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlL {
+			a.tapp.Sync()
+			return nil
+		}
+		return event
+	})
+
+	// SIGCONT: redraws the screen after resuming from a suspend or switching
+	// back from another terminal app / tmux pane.
+	contCh := make(chan os.Signal, 1)
+	signal.Notify(contCh, syscall.SIGCONT)
+	go func() {
+		for range contCh {
+			a.tapp.Draw()
+		}
+	}()
+
+	// SIGTSTP (Ctrl+Z): let tview release the terminal cleanly before
+	// stopping, then reinitialise when the process is resumed with fg.
+	tstpCh := make(chan os.Signal, 1)
+	signal.Notify(tstpCh, syscall.SIGTSTP)
+	go func() {
+		for range tstpCh {
+			a.tapp.Suspend(func() {
+				signal.Stop(tstpCh)
+				// SIGSTOP cannot be caught or ignored, so fg will always resume.
+				_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+				signal.Notify(tstpCh, syscall.SIGTSTP)
+			})
+		}
+	}()
+
+	err := a.tapp.Run()
+	signal.Stop(contCh)
+	signal.Stop(tstpCh)
+	return err
 }
 
 func (a *App) loadInitialData() error {
