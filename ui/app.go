@@ -217,7 +217,7 @@ func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
 
 func (a *App) showInvoicePage(payReq string) {
 	tv := tview.NewTextView().
-		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Press Esc or 'b' to go back)[-]", payReq)).
+		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Press Esc to go back)[-]", payReq)).
 		SetDynamicColors(true).
 		SetWordWrap(true).
 		SetScrollable(true)
@@ -225,7 +225,7 @@ func (a *App) showInvoicePage(payReq string) {
 
 	a.pages.AddAndSwitchToPage("invoice", tv, true)
 	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Rune() == 'b' || event.Key() == tcell.KeyEscape {
+		if event.Key() == tcell.KeyEscape {
 			a.tapp.SetInputCapture(nil)
 			a.showDashboard()
 		}
@@ -424,11 +424,11 @@ func (a *App) showAssets() {
 		SetText(text).
 		SetDynamicColors(true).
 		SetScrollable(true)
-	tv.SetBorder(true).SetTitle(" Taproot Assets  (b=back) ")
+	tv.SetBorder(true).SetTitle(" Taproot Assets  (Esc=back) ")
 
 	a.pages.AddAndSwitchToPage("assets", tv, true)
 	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Rune() == 'b' || event.Key() == tcell.KeyEscape {
+		if event.Key() == tcell.KeyEscape {
 			a.tapp.SetInputCapture(nil)
 			a.showDashboard()
 		}
