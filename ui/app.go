@@ -42,7 +42,7 @@ func Run(clients *client.Clients) error {
 		return err
 	}
 
-	a.tapp.SetRoot(a.pages, true).EnableMouse(true)
+	a.tapp.SetRoot(a.pages, true)
 	a.showDashboard()
 
 	// Ctrl+L forces a full redraw on any screen.
