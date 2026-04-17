@@ -50,6 +50,9 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
+			if !c.IsSet("macaroonpath") {
+				cfg.MacaroonPath = config.MacaroonPath(cfg.Network)
+			}
 			return runTUI(cfg)
 		},
 	}

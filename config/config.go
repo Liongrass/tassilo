@@ -39,17 +39,21 @@ func DefaultLitDir() string {
 	}
 }
 
+// MacaroonPath returns the default lit.macaroon path for the given network.
+func MacaroonPath(network string) string {
+	return filepath.Join(DefaultLitDir(), network, "lit.macaroon")
+}
+
 // DefaultConfig returns a Config with platform-appropriate defaults.
 func DefaultConfig() *Config {
-	litDir := DefaultLitDir()
 	network := DefaultNetwork
 	if n := os.Getenv("TASSILO_NETWORK"); n != "" {
 		network = n
 	}
 	return &Config{
 		RPCServer:    DefaultHost + ":" + DefaultRPCPort,
-		TLSCertPath:  filepath.Join(litDir, "tls.cert"),
-		MacaroonPath: filepath.Join(litDir, network, "lit.macaroon"),
+		TLSCertPath:  filepath.Join(DefaultLitDir(), "tls.cert"),
+		MacaroonPath: MacaroonPath(network),
 		Network:      network,
 	}
 }
