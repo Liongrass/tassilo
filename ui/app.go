@@ -62,6 +62,24 @@ func (a *App) loadInitialData() error {
 	return nil
 }
 
+// withEsc wraps a primitive so that pressing Esc calls back.
+func withEsc(p tview.Primitive, back func()) tview.Primitive {
+	type inputCapturer interface {
+		tview.Primitive
+		SetInputCapture(func(*tcell.EventKey) *tcell.EventKey) *tview.Box
+	}
+	if ic, ok := p.(inputCapturer); ok {
+		ic.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+			if event.Key() == tcell.KeyEscape {
+				back()
+				return nil
+			}
+			return event
+		})
+	}
+	return p
+}
+
 func (a *App) showDashboard() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -109,6 +127,13 @@ func (a *App) showDashboard() {
 		}).
 		AddItem("Quit", "Exit Tassilo", 'q', func() { a.tapp.Stop() })
 	menu.SetBorder(true).SetTitle(" Actions ")
+	menu.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.tapp.Stop()
+			return nil
+		}
+		return event
+	})
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(header, 1, 0, false).
@@ -164,7 +189,14 @@ func (a *App) showReceive() {
 		}).
 		AddButton("Back", func() { a.showDashboard() })
 
-	form.SetBorder(true).SetTitle(" Receive — Create Invoice ")
+	form.SetBorder(true).SetTitle(" Receive — Create Invoice (Esc=back) ")
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
 	a.pages.AddAndSwitchToPage("receive", form, true)
 }
 
@@ -217,20 +249,19 @@ func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
 
 func (a *App) showInvoicePage(payReq string) {
 	tv := tview.NewTextView().
-		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Press Esc to go back)[-]", payReq)).
+		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Esc to go back)[-]", payReq)).
 		SetDynamicColors(true).
 		SetWordWrap(true).
 		SetScrollable(true)
 	tv.SetBorder(true).SetTitle(" Invoice ")
-
-	a.pages.AddAndSwitchToPage("invoice", tv, true)
-	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
-			a.tapp.SetInputCapture(nil)
 			a.showDashboard()
+			return nil
 		}
 		return event
 	})
+	a.pages.AddAndSwitchToPage("invoice", tv, true)
 }
 
 func (a *App) showSend() {
@@ -243,7 +274,14 @@ func (a *App) showSend() {
 		}).
 		AddButton("Back", func() { a.showDashboard() })
 
-	form.SetBorder(true).SetTitle(" Send — Pay Invoice ")
+	form.SetBorder(true).SetTitle(" Send — Pay Invoice (Esc=back) ")
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
 	a.pages.AddAndSwitchToPage("send", form, true)
 }
 
@@ -327,7 +365,14 @@ func (a *App) showOpenChannel() {
 		}).
 		AddButton("Back", func() { a.showDashboard() })
 
-	form.SetBorder(true).SetTitle(" Open Channel ")
+	form.SetBorder(true).SetTitle(" Open Channel (Esc=back) ")
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
 	a.pages.AddAndSwitchToPage("openchan", form, true)
 }
 
@@ -424,16 +469,15 @@ func (a *App) showAssets() {
 		SetText(text).
 		SetDynamicColors(true).
 		SetScrollable(true)
-	tv.SetBorder(true).SetTitle(" Taproot Assets  (Esc=back) ")
-
-	a.pages.AddAndSwitchToPage("assets", tv, true)
-	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	tv.SetBorder(true).SetTitle(" Taproot Assets ")
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
-			a.tapp.SetInputCapture(nil)
 			a.showDashboard()
+			return nil
 		}
 		return event
 	})
+	a.pages.AddAndSwitchToPage("assets", tv, true)
 }
 
 func (a *App) showModal(msg string, done func()) {
@@ -441,6 +485,13 @@ func (a *App) showModal(msg string, done func()) {
 		SetText(msg).
 		AddButtons([]string{"OK"}).
 		SetDoneFunc(func(_ int, _ string) { done() })
+	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			done()
+			return nil
+		}
+		return event
+	})
 	a.pages.AddAndSwitchToPage("modal", modal, true)
 }
 
