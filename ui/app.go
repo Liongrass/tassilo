@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -637,19 +638,27 @@ func (a *App) showAssets() {
 	} else if len(resp.Assets) == 0 {
 		text = "No taproot assets found."
 	} else {
+		assets := resp.Assets
+		sort.Slice(assets, func(i, j int) bool {
+			return assets[i].AssetGenesis.Name < assets[j].AssetGenesis.Name
+		})
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("[yellow]%d asset(s) found[-]\n\n", len(resp.Assets)))
-		for _, asset := range resp.Assets {
+		sb.WriteString(fmt.Sprintf("[yellow]%d asset(s) found[-]\n\n", len(assets)))
+		for _, asset := range assets {
 			dd := uint32(0)
 			if asset.DecimalDisplay != nil {
 				dd = asset.DecimalDisplay.DecimalDisplay
 			}
+			groupKey := "(ungrouped)"
+			if asset.AssetGroup != nil && len(asset.AssetGroup.TweakedGroupKey) > 0 {
+				groupKey = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
+			}
 			sb.WriteString(fmt.Sprintf(
-				"[cyan]%-24s[-]  amount=[green]%s[-]\n  id:      %x\n  group:   %s\n  anchor:  %s\n\n",
+				"[cyan]%s[-]  [green]%s[-]\n  id:     %x\n  group:  %s\n  anchor: %s\n\n",
 				asset.AssetGenesis.Name,
 				formatAssetAmount(asset.Amount, dd),
 				asset.AssetGenesis.AssetId,
-				groupKeyStr(asset),
+				groupKey,
 				asset.ChainAnchor.GetAnchorOutpoint(),
 			))
 		}
@@ -702,13 +711,3 @@ func hexToBytes(s string) ([]byte, error) {
 	return b, nil
 }
 
-func groupKeyStr(a *taprpc.Asset) string {
-	if a.AssetGroup == nil || len(a.AssetGroup.TweakedGroupKey) == 0 {
-		return "(ungrouped)"
-	}
-	k := fmt.Sprintf("%x", a.AssetGroup.TweakedGroupKey)
-	if len(k) > 24 {
-		return k[:24] + "…"
-	}
-	return k
-}
