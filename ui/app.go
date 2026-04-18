@@ -690,7 +690,7 @@ func (a *App) doSendBTC(payReq string) {
 			return
 		}
 		if resp.Status == lnrpc.Payment_SUCCEEDED {
-			a.showModal(fmt.Sprintf("[green]Payment sent![-]\nPreimage: %x", resp.PaymentPreimage), func() { a.showDashboard() })
+			a.showModal(fmt.Sprintf("[green]Payment sent![-]\nPreimage: %s", resp.PaymentPreimage), func() { a.showDashboard() })
 			return
 		}
 		if resp.Status == lnrpc.Payment_FAILED {
@@ -730,7 +730,7 @@ func (a *App) doSendAsset(payReq, groupKeyHex string) {
 		}
 		if pr := resp.GetPaymentResult(); pr != nil {
 			if pr.Status == lnrpc.Payment_SUCCEEDED {
-				a.showModal(fmt.Sprintf("[green]Asset payment sent![-]\nPreimage: %x", pr.PaymentPreimage), func() { a.showDashboard() })
+				a.showModal(fmt.Sprintf("[green]Asset payment sent![-]\nPreimage: %s", pr.PaymentPreimage), func() { a.showDashboard() })
 				return
 			}
 			if pr.Status == lnrpc.Payment_FAILED {
