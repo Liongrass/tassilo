@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -120,14 +121,7 @@ func (a *App) showDashboard() {
 	chanBal, _ := a.clients.LN.ChannelBalance(ctx, &lnrpc.ChannelBalanceRequest{})
 	walletBal, _ := a.clients.LN.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
 
-	chanAssets, _ := a.clients.Tap.ListBalances(ctx, &taprpc.ListBalancesRequest{
-		GroupBy: &taprpc.ListBalancesRequest_GroupKey{GroupKey: true},
-		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
-			Type: &taprpc.ScriptKeyTypeQuery_ExplicitType{
-				ExplicitType: taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL,
-			},
-		},
-	})
+	chanList, _ := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
 	onchainGroups, _ := a.clients.Tap.ListGroups(ctx, &taprpc.ListGroupsRequest{})
 
 	header := tview.NewTextView().
@@ -143,7 +137,7 @@ func (a *App) showDashboard() {
 		chanBal.GetRemoteBalance().GetSat(),
 	)
 
-	offchainAssets := buildOffchainAssetText(chanAssets.GetAssetGroupBalances())
+	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()))
 
 	onchainBTC := fmt.Sprintf(
 		"[yellow]Onchain Bitcoin[-]\n"+
@@ -192,7 +186,38 @@ func (a *App) showDashboard() {
 	a.pages.AddAndSwitchToPage("dashboard", flex, true)
 }
 
-func buildOffchainAssetText(balances map[string]*taprpc.AssetGroupBalance) string {
+// jsonAssetChannel matches the JSON tapd encodes into lnrpc.Channel.CustomChannelData.
+type jsonAssetChannel struct {
+	LocalBalance  uint64 `json:"local_balance"`
+	RemoteBalance uint64 `json:"remote_balance"`
+	GroupKey      string `json:"group_key,omitempty"`
+}
+
+type assetGroupBalance struct {
+	local  uint64
+	remote uint64
+}
+
+func aggregateAssetChannelBalances(channels []*lnrpc.Channel) map[string]*assetGroupBalance {
+	result := make(map[string]*assetGroupBalance)
+	for _, ch := range channels {
+		if len(ch.CustomChannelData) == 0 {
+			continue
+		}
+		var data jsonAssetChannel
+		if err := json.Unmarshal(ch.CustomChannelData, &data); err != nil || data.GroupKey == "" {
+			continue
+		}
+		if result[data.GroupKey] == nil {
+			result[data.GroupKey] = &assetGroupBalance{}
+		}
+		result[data.GroupKey].local += data.LocalBalance
+		result[data.GroupKey].remote += data.RemoteBalance
+	}
+	return result
+}
+
+func buildOffchainAssetText(balances map[string]*assetGroupBalance) string {
 	if len(balances) == 0 {
 		return "[yellow]Lightning (Assets)[-]\n  (none)\n"
 	}
@@ -203,7 +228,10 @@ func buildOffchainAssetText(balances map[string]*taprpc.AssetGroupBalance) strin
 		if len(key) > 16 {
 			key = key[:16] + "…"
 		}
-		sb.WriteString(fmt.Sprintf("  [green]%d[-]  (group: %s)\n", bal.Balance, key))
+		sb.WriteString(fmt.Sprintf(
+			"  Local:  [green]%d[-]\n  Remote: [grey]%d[-]  (group: %s)\n",
+			bal.local, bal.remote, key,
+		))
 	}
 	return sb.String()
 }
