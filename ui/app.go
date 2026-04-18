@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -574,19 +575,11 @@ func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uin
 }
 
 func (a *App) showInvoicePage(payReq string) {
-	tv := tview.NewTextView().
-		SetText(fmt.Sprintf("[yellow]── Invoice (Esc to go back) ──[-]\n\n%s", payReq)).
-		SetDynamicColors(true).
-		SetWrap(true).
-		SetScrollable(true)
-	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			a.showDashboard()
-			return nil
-		}
-		return event
+	a.tapp.Suspend(func() {
+		fmt.Printf("\nPayment Request:\n\n%s\n\nPress Enter to return...\n", payReq)
+		bufio.NewReader(os.Stdin).ReadString('\n')
 	})
-	a.pages.AddAndSwitchToPage("invoice", tv, true)
+	a.showDashboard()
 }
 
 func (a *App) showSend() {
