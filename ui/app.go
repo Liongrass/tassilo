@@ -434,8 +434,9 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 	})
 
 	type assetOption struct {
-		name    string
-		assetID string // hex genesis ID
+		name      string
+		assetID   string // hex genesis ID (used for the invoice API)
+		displayID string // group key for grouped assets, asset ID for ungrouped
 	}
 	var options []assetOption
 	seen := make(map[string]bool)
@@ -443,19 +444,24 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 		if asset.ScriptKeyType != taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL {
 			continue
 		}
+		assetIDHex := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
 		var groupKey string
+		var displayID string
 		if asset.AssetGroup != nil && len(asset.AssetGroup.TweakedGroupKey) > 0 {
 			groupKey = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
+			displayID = groupKey
 		} else {
-			groupKey = fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
+			groupKey = assetIDHex
+			displayID = assetIDHex
 		}
 		if seen[groupKey] {
 			continue
 		}
 		seen[groupKey] = true
 		options = append(options, assetOption{
-			name:    asset.AssetGenesis.Name,
-			assetID: fmt.Sprintf("%x", asset.AssetGenesis.AssetId),
+			name:      asset.AssetGenesis.Name,
+			assetID:   assetIDHex,
+			displayID: displayID,
 		})
 	}
 	sort.Slice(options, func(i, j int) bool {
@@ -469,7 +475,7 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 	})
 	for _, opt := range options {
 		opt := opt
-		list.AddItem(opt.name, opt.assetID, 0, func() {
+		list.AddItem(opt.name, opt.displayID, 0, func() {
 			a.pages.SwitchToPage("receive")
 			done(opt.name, opt.assetID)
 		})
