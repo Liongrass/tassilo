@@ -122,7 +122,7 @@ func (a *App) showDashboard() {
 	walletBal, _ := a.clients.LN.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
 
 	chanList, _ := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
-	onchainGroups, _ := a.clients.Tap.ListGroups(ctx, &taprpc.ListGroupsRequest{})
+	assetList, _ := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{})
 
 	header := tview.NewTextView().
 		SetText(fmt.Sprintf(" Tassilo  |  %s  |  %s", a.nodeInfo.Alias, a.nodeInfo.IdentityPubkey[:16]+"…")).
@@ -131,23 +131,29 @@ func (a *App) showDashboard() {
 
 	offchainBTC := fmt.Sprintf(
 		"[yellow]Lightning (BTC)[-]\n"+
-			"  Local:  [green]%d sat[-]\n"+
-			"  Remote: [grey]%d sat[-]\n",
-		chanBal.GetLocalBalance().GetSat(),
-		chanBal.GetRemoteBalance().GetSat(),
+			"  Local:  [green]%s sat[-]\n"+
+			"  Remote: [grey]%s sat[-]\n",
+		formatCommas(chanBal.GetLocalBalance().GetSat()),
+		formatCommas(chanBal.GetRemoteBalance().GetSat()),
 	)
 
-	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()))
+	onchainGroups := buildOnchainAssetGroups(assetList.GetAssets())
+	decimalByGroup := make(map[string]uint32, len(onchainGroups))
+	for key, g := range onchainGroups {
+		decimalByGroup[key] = g.decimalDisplay
+	}
+
+	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()), decimalByGroup)
 
 	onchainBTC := fmt.Sprintf(
 		"[yellow]Onchain Bitcoin[-]\n"+
-			"  Confirmed:   [green]%d sat[-]\n"+
-			"  Unconfirmed: [grey]%d sat[-]\n",
-		walletBal.GetConfirmedBalance(),
-		walletBal.GetUnconfirmedBalance(),
+			"  Confirmed:   [green]%s sat[-]\n"+
+			"  Unconfirmed: [grey]%s sat[-]\n",
+		formatCommas(walletBal.GetConfirmedBalance()),
+		formatCommas(walletBal.GetUnconfirmedBalance()),
 	)
 
-	onchainAssets := buildOnchainAssetText(onchainGroups.GetGroups())
+	onchainAssets := buildOnchainAssetText(onchainGroups)
 
 	balanceView := tview.NewTextView().
 		SetText(offchainBTC + "\n" + offchainAssets + "\n" + onchainBTC + "\n" + onchainAssets).
@@ -217,47 +223,109 @@ func aggregateAssetChannelBalances(channels []*lnrpc.Channel) map[string]*assetG
 	return result
 }
 
-func buildOffchainAssetText(balances map[string]*assetGroupBalance) string {
+// onchainAssetGroup holds aggregated onchain info per group key.
+type onchainAssetGroup struct {
+	name           string
+	amount         uint64
+	decimalDisplay uint32
+}
+
+// buildOnchainAssetGroups aggregates wallet assets by group key (or asset ID
+// for ungrouped assets), capturing the name and decimal_display from the first
+// asset seen in each group.
+func buildOnchainAssetGroups(assets []*taprpc.Asset) map[string]*onchainAssetGroup {
+	groups := make(map[string]*onchainAssetGroup)
+	for _, a := range assets {
+		var key string
+		if a.AssetGroup != nil && len(a.AssetGroup.TweakedGroupKey) > 0 {
+			key = fmt.Sprintf("%x", a.AssetGroup.TweakedGroupKey)
+		} else {
+			key = fmt.Sprintf("%x", a.AssetGenesis.AssetId)
+		}
+		if groups[key] == nil {
+			dd := uint32(0)
+			if a.DecimalDisplay != nil {
+				dd = a.DecimalDisplay.DecimalDisplay
+			}
+			groups[key] = &onchainAssetGroup{
+				name:           a.AssetGenesis.Name,
+				decimalDisplay: dd,
+			}
+		}
+		groups[key].amount += a.Amount
+	}
+	return groups
+}
+
+func buildOffchainAssetText(balances map[string]*assetGroupBalance, decimalByGroup map[string]uint32) string {
 	if len(balances) == 0 {
 		return "[yellow]Lightning (Assets)[-]\n  (none)\n"
 	}
 	var sb strings.Builder
 	sb.WriteString("[yellow]Lightning (Assets)[-]\n")
 	for groupKey, bal := range balances {
+		dd := decimalByGroup[groupKey]
 		key := groupKey
 		if len(key) > 16 {
 			key = key[:16] + "…"
 		}
 		sb.WriteString(fmt.Sprintf(
-			"  Local:  [green]%d[-]\n  Remote: [grey]%d[-]  (group: %s)\n",
-			bal.local, bal.remote, key,
+			"  Local:  [green]%s[-]\n  Remote: [grey]%s[-]  (group: %s)\n",
+			formatAssetAmount(bal.local, dd),
+			formatAssetAmount(bal.remote, dd),
+			key,
 		))
 	}
 	return sb.String()
 }
 
-func buildOnchainAssetText(groups map[string]*taprpc.GroupedAssets) string {
+func buildOnchainAssetText(groups map[string]*onchainAssetGroup) string {
 	if len(groups) == 0 {
 		return "[yellow]Onchain (Assets)[-]\n  (none)\n"
 	}
 	var sb strings.Builder
 	sb.WriteString("[yellow]Onchain (Assets)[-]\n")
-	for groupKey, group := range groups {
+	for groupKey, g := range groups {
 		key := groupKey
 		if len(key) > 16 {
 			key = key[:16] + "…"
 		}
-		var total uint64
-		var name string
-		for _, asset := range group.Assets {
-			total += asset.Amount
-			if name == "" {
-				name = asset.Tag
-			}
-		}
-		sb.WriteString(fmt.Sprintf("  %-20s [green]%d[-]  (group: %s)\n", name, total, key))
+		sb.WriteString(fmt.Sprintf(
+			"  %-20s [green]%s[-]  (group: %s)\n",
+			g.name, formatAssetAmount(g.amount, g.decimalDisplay), key,
+		))
 	}
 	return sb.String()
+}
+
+// formatCommas inserts thousand separators into an integer.
+func formatCommas[T uint64 | int64](n T) string {
+	s := fmt.Sprintf("%d", n)
+	out := make([]byte, 0, len(s)+(len(s)-1)/3)
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 && s[0] != '-' {
+			out = append(out, ',')
+		}
+		out = append(out, byte(c))
+	}
+	return string(out)
+}
+
+// formatAssetAmount divides amount by decimalDisplay and formats with commas.
+// decimalDisplay == 0 means no scaling.
+func formatAssetAmount(amount uint64, decimalDisplay uint32) string {
+	if decimalDisplay == 0 {
+		return formatCommas(amount)
+	}
+	div := uint64(decimalDisplay)
+	whole := amount / div
+	frac := amount % div
+	// Determine how many decimal places decimalDisplay represents.
+	places := 0
+	for d := div; d >= 10; d /= 10 {
+		places++
+	}
+	return fmt.Sprintf("%s.%0*d", formatCommas(whole), places, frac)
 }
 
 func (a *App) showReceive() {
@@ -541,10 +609,14 @@ func (a *App) showAssets() {
 		var sb strings.Builder
 		sb.WriteString(fmt.Sprintf("[yellow]%d asset(s) found[-]\n\n", len(resp.Assets)))
 		for _, asset := range resp.Assets {
+			dd := uint32(0)
+			if asset.DecimalDisplay != nil {
+				dd = asset.DecimalDisplay.DecimalDisplay
+			}
 			sb.WriteString(fmt.Sprintf(
-				"[cyan]%-24s[-]  amount=[green]%d[-]\n  id:      %x\n  group:   %s\n  anchor:  %s\n\n",
+				"[cyan]%-24s[-]  amount=[green]%s[-]\n  id:      %x\n  group:   %s\n  anchor:  %s\n\n",
 				asset.AssetGenesis.Name,
-				asset.Amount,
+				formatAssetAmount(asset.Amount, dd),
 				asset.AssetGenesis.AssetId,
 				groupKeyStr(asset),
 				asset.ChainAnchor.GetAnchorOutpoint(),
