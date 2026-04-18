@@ -361,7 +361,9 @@ func formatAssetAmount(amount uint64, decimalDisplay uint32) string {
 }
 
 func (a *App) showReceive() {
-	var selectedAssetID string // hex asset ID; empty = BTC
+	var selectedAssetIDHex  string // genesis asset ID hex; empty = BTC or grouped
+	var selectedGroupKeyHex string // tweaked group key hex; non-empty = use GroupKey
+	var selectedDecimal     uint32
 	var amountStr, memoStr string
 	var settingFromPicker bool
 
@@ -371,8 +373,10 @@ func (a *App) showReceive() {
 		SetPlaceholder("BTC  (press Enter to pick)")
 	assetField.SetChangedFunc(func(t string) {
 		if !settingFromPicker {
-			// user typed manually — treat as raw hex ID
-			selectedAssetID = t
+			// user typed manually — treat as raw hex asset ID, no group key
+			selectedAssetIDHex = t
+			selectedGroupKeyHex = ""
+			selectedDecimal = 0
 		}
 	})
 
@@ -381,7 +385,7 @@ func (a *App) showReceive() {
 		AddInputField("Amount (units or sat)", "", 20, nil, func(t string) { amountStr = t }).
 		AddInputField("Memo (optional)", "", 60, nil, func(t string) { memoStr = t }).
 		AddButton("Generate", func() {
-			a.doCreateInvoice(selectedAssetID, amountStr, memoStr)
+			a.doCreateInvoice(selectedAssetIDHex, selectedGroupKeyHex, selectedDecimal, amountStr, memoStr)
 		}).
 		AddButton("Back", func() { a.showDashboard() })
 	form.SetBorder(true).SetTitle(" Receive — Create Invoice (Esc=back) ")
@@ -389,20 +393,22 @@ func (a *App) showReceive() {
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.showAssetPicker(func(name, id string) {
+			a.showAssetPicker(func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
 				if name == "" {
 					// cancelled — leave current selection unchanged
 					a.tapp.SetFocus(form)
 					return
 				}
 				settingFromPicker = true
-				if id == "" {
+				if assetIDHex == "" && groupKeyHex == "" {
 					assetField.SetText("") // BTC: show placeholder
 				} else {
 					assetField.SetText(name)
 				}
 				settingFromPicker = false
-				selectedAssetID = id
+				selectedAssetIDHex = assetIDHex
+				selectedGroupKeyHex = groupKeyHex
+				selectedDecimal = decimalDisplay
 				a.tapp.SetFocus(form)
 			})
 			return nil
@@ -423,7 +429,7 @@ func (a *App) showReceive() {
 	a.pages.AddAndSwitchToPage("receive", form, true)
 }
 
-func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
+func (a *App) showAssetPicker(done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -434,9 +440,11 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 	})
 
 	type assetOption struct {
-		name      string
-		assetID   string // hex genesis ID (used for the invoice API)
-		displayID string // group key for grouped assets, asset ID for ungrouped
+		name           string
+		assetIDHex     string // hex genesis ID
+		groupKeyHex    string // hex tweaked group key; empty = ungrouped
+		displayID      string // what to show as secondary label
+		decimalDisplay uint32
 	}
 	var options []assetOption
 	seen := make(map[string]bool)
@@ -445,23 +453,31 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 			continue
 		}
 		assetIDHex := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
-		var groupKey string
-		var displayID string
+		var groupKeyHex, displayID string
 		if asset.AssetGroup != nil && len(asset.AssetGroup.TweakedGroupKey) > 0 {
-			groupKey = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
-			displayID = groupKey
+			groupKeyHex = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
+			displayID = groupKeyHex
 		} else {
-			groupKey = assetIDHex
 			displayID = assetIDHex
 		}
-		if seen[groupKey] {
+		dedupeKey := groupKeyHex
+		if dedupeKey == "" {
+			dedupeKey = assetIDHex
+		}
+		if seen[dedupeKey] {
 			continue
 		}
-		seen[groupKey] = true
+		seen[dedupeKey] = true
+		dd := uint32(0)
+		if asset.DecimalDisplay != nil {
+			dd = asset.DecimalDisplay.DecimalDisplay
+		}
 		options = append(options, assetOption{
-			name:      asset.AssetGenesis.Name,
-			assetID:   assetIDHex,
-			displayID: displayID,
+			name:           asset.AssetGenesis.Name,
+			assetIDHex:     assetIDHex,
+			groupKeyHex:    groupKeyHex,
+			displayID:      displayID,
+			decimalDisplay: dd,
 		})
 	}
 	sort.Slice(options, func(i, j int) bool {
@@ -471,20 +487,20 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 	list := tview.NewList()
 	list.AddItem("BTC", "Bitcoin — no asset", 0, func() {
 		a.pages.SwitchToPage("receive")
-		done("BTC", "")
+		done("BTC", "", "", 0)
 	})
 	for _, opt := range options {
 		opt := opt
 		list.AddItem(opt.name, opt.displayID, 0, func() {
 			a.pages.SwitchToPage("receive")
-			done(opt.name, opt.assetID)
+			done(opt.name, opt.assetIDHex, opt.groupKeyHex, opt.decimalDisplay)
 		})
 	}
 	list.SetBorder(true).SetTitle(" Select Asset (Esc=cancel) ")
 	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.pages.SwitchToPage("receive")
-			done("", "") // cancel
+			done("", "", "", 0) // cancel: name=="" signals no selection
 			return nil
 		}
 		return event
@@ -492,9 +508,9 @@ func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
 	a.pages.AddAndSwitchToPage("assetpicker", list, true)
 }
 
-func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
-	amount, err := strconv.ParseInt(amountStr, 10, 64)
-	if err != nil || amount <= 0 {
+func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uint32, amountStr, memo string) {
+	amount, err := strconv.ParseUint(amountStr, 10, 64)
+	if err != nil || amount == 0 {
 		a.showModal("Invalid amount.", func() { a.showReceive() })
 		return
 	}
@@ -504,10 +520,11 @@ func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
 
 	var payReq string
 
-	if assetID == "" {
+	isBTC := assetIDHex == "" && groupKeyHex == ""
+	if isBTC {
 		resp, err := a.clients.LN.AddInvoice(ctx, &lnrpc.Invoice{
 			Memo:  memo,
-			Value: amount,
+			Value: int64(amount),
 		})
 		if err != nil {
 			a.showModal(fmt.Sprintf("Error: %v", err), func() { a.showReceive() })
@@ -515,18 +532,35 @@ func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
 		}
 		payReq = resp.PaymentRequest
 	} else {
-		assetIDBytes, err := hexToBytes(assetID)
-		if err != nil || len(assetIDBytes) != 32 {
-			a.showModal("Invalid asset ID (must be 32-byte hex).", func() { a.showReceive() })
-			return
+		// Scale the human-readable amount by 10^decimalDisplay.
+		scaledAmount := amount
+		for i := uint32(0); i < decimalDisplay; i++ {
+			scaledAmount *= 10
 		}
-		resp, err := a.clients.TapChannel.AddInvoice(ctx, &tapchannelrpc.AddInvoiceRequest{
-			AssetId:     assetIDBytes,
-			AssetAmount: uint64(amount),
+
+		req := &tapchannelrpc.AddInvoiceRequest{
+			AssetAmount: scaledAmount,
 			InvoiceRequest: &lnrpc.Invoice{
 				Memo: memo,
 			},
-		})
+		}
+		if groupKeyHex != "" {
+			groupKeyBytes, err := hexToBytes(groupKeyHex)
+			if err != nil {
+				a.showModal("Invalid group key.", func() { a.showReceive() })
+				return
+			}
+			req.GroupKey = groupKeyBytes
+		} else {
+			assetIDBytes, err := hexToBytes(assetIDHex)
+			if err != nil || len(assetIDBytes) != 32 {
+				a.showModal("Invalid asset ID (must be 32-byte hex).", func() { a.showReceive() })
+				return
+			}
+			req.AssetId = assetIDBytes
+		}
+
+		resp, err := a.clients.TapChannel.AddInvoice(ctx, req)
 		if err != nil {
 			a.showModal(fmt.Sprintf("Error: %v", err), func() { a.showReceive() })
 			return
