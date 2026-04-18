@@ -577,7 +577,7 @@ func (a *App) showInvoicePage(payReq string) {
 	tv := tview.NewTextView().
 		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Esc to go back)[-]", payReq)).
 		SetDynamicColors(true).
-		SetWrap(false).
+		SetWrap(true).
 		SetScrollable(true)
 	tv.SetBorder(true).SetTitle(" Invoice ")
 	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
