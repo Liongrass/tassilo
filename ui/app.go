@@ -575,11 +575,10 @@ func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uin
 
 func (a *App) showInvoicePage(payReq string) {
 	tv := tview.NewTextView().
-		SetText(fmt.Sprintf("[yellow]Payment Request[-]\n\n%s\n\n[grey](Esc to go back)[-]", payReq)).
+		SetText(fmt.Sprintf("[yellow]── Invoice (Esc to go back) ──[-]\n\n%s", payReq)).
 		SetDynamicColors(true).
 		SetWrap(true).
 		SetScrollable(true)
-	tv.SetBorder(true).SetTitle(" Invoice ")
 	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
