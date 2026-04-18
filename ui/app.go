@@ -588,7 +588,11 @@ func (a *App) showSend() {
 
 	form.AddInputField("Payment Request (bolt11)", "", 0, nil, func(t string) { payReqStr = t }).
 		AddButton("Pay", func() {
-			a.doSendPayment(payReqStr)
+			if strings.TrimSpace(payReqStr) == "" {
+				a.showModal("Payment request is empty.", func() { a.showSend() })
+				return
+			}
+			a.showPaymentMethodPicker(payReqStr)
 		}).
 		AddButton("Back", func() { a.showDashboard() })
 
@@ -603,51 +607,80 @@ func (a *App) showSend() {
 	a.pages.AddAndSwitchToPage("send", form, true)
 }
 
-func (a *App) doSendPayment(payReq string) {
-	if strings.TrimSpace(payReq) == "" {
-		a.showModal("Payment request is empty.", func() { a.showSend() })
-		return
+func (a *App) showPaymentMethodPicker(payReq string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	chanBal, _ := a.clients.LN.ChannelBalance(ctx, &lnrpc.ChannelBalanceRequest{})
+	chanList, _ := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
+	assetList, _ := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+		},
+	})
+
+	groupMetas := buildGroupMetaMap(assetList.GetAssets())
+	assetBals := aggregateAssetChannelBalances(chanList.GetChannels())
+
+	type entry struct {
+		name           string
+		groupKeyHex    string
+		decimalDisplay uint32
+		local          uint64
+	}
+	var entries []entry
+	for groupKey, bal := range assetBals {
+		meta := groupMetas[groupKey]
+		if meta == nil {
+			continue
+		}
+		entries = append(entries, entry{
+			name:           meta.name,
+			groupKeyHex:    groupKey,
+			decimalDisplay: meta.decimalDisplay,
+			local:          bal.local,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	list := tview.NewList()
+	btcLocal := chanBal.GetLocalBalance().GetSat()
+	list.AddItem("Bitcoin", fmt.Sprintf("%s sat local", formatCommas(btcLocal)), 0, func() {
+		a.doSendBTC(payReq)
+	})
+	for _, e := range entries {
+		e := e
+		list.AddItem(
+			e.name,
+			fmt.Sprintf("%s local", formatAssetAmount(e.local, e.decimalDisplay)),
+			0,
+			func() { a.doSendAsset(payReq, e.groupKeyHex) },
+		)
 	}
 
+	list.SetBorder(true).SetTitle(" Pay With (Esc=back) ")
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showSend()
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("paywith", list, true)
+}
+
+func (a *App) doSendBTC(payReq string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Try as taproot asset payment first.
-	tapStream, err := a.clients.TapChannel.SendPayment(ctx, &tapchannelrpc.SendPaymentRequest{
-		PaymentRequest: &routerrpc.SendPaymentRequest{
-			PaymentRequest: payReq,
-			TimeoutSeconds: 60,
-			FeeLimitSat:    10000,
-		},
-	})
-	if err == nil {
-		for {
-			resp, err := tapStream.Recv()
-			if err != nil {
-				break
-			}
-			if pr := resp.GetPaymentResult(); pr != nil {
-				if pr.Status == lnrpc.Payment_SUCCEEDED {
-					a.showModal(fmt.Sprintf("[green]Asset payment sent![-]\nPreimage: %x", pr.PaymentPreimage), func() { a.showDashboard() })
-					return
-				}
-				if pr.Status == lnrpc.Payment_FAILED {
-					a.showModal(fmt.Sprintf("Asset payment failed: %s", pr.FailureReason), func() { a.showSend() })
-					return
-				}
-			}
-		}
-	}
-
-	// Fall back to plain BTC payment.
 	router := routerrpc.NewRouterClient(a.clients.Conn())
-	stream, err2 := router.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
+	stream, err := router.SendPaymentV2(ctx, &routerrpc.SendPaymentRequest{
 		PaymentRequest: payReq,
 		TimeoutSeconds: 60,
 		FeeLimitSat:    10000,
 	})
-	if err2 != nil {
-		a.showModal(fmt.Sprintf("Payment failed:\n%v", err2), func() { a.showSend() })
+	if err != nil {
+		a.showModal(fmt.Sprintf("Payment failed:\n%v", err), func() { a.showSend() })
 		return
 	}
 	for {
@@ -663,6 +696,47 @@ func (a *App) doSendPayment(payReq string) {
 		if resp.Status == lnrpc.Payment_FAILED {
 			a.showModal(fmt.Sprintf("Payment failed: %s", resp.FailureReason), func() { a.showSend() })
 			return
+		}
+	}
+}
+
+func (a *App) doSendAsset(payReq, groupKeyHex string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	groupKeyBytes, err := hexToBytes(groupKeyHex)
+	if err != nil {
+		a.showModal("Invalid group key.", func() { a.showSend() })
+		return
+	}
+
+	stream, err := a.clients.TapChannel.SendPayment(ctx, &tapchannelrpc.SendPaymentRequest{
+		GroupKey: groupKeyBytes,
+		PaymentRequest: &routerrpc.SendPaymentRequest{
+			PaymentRequest: payReq,
+			TimeoutSeconds: 60,
+			FeeLimitSat:    10000,
+		},
+	})
+	if err != nil {
+		a.showModal(fmt.Sprintf("Error: %v", err), func() { a.showSend() })
+		return
+	}
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			a.showModal(fmt.Sprintf("Stream error: %v", err), func() { a.showSend() })
+			return
+		}
+		if pr := resp.GetPaymentResult(); pr != nil {
+			if pr.Status == lnrpc.Payment_SUCCEEDED {
+				a.showModal(fmt.Sprintf("[green]Asset payment sent![-]\nPreimage: %x", pr.PaymentPreimage), func() { a.showDashboard() })
+				return
+			}
+			if pr.Status == lnrpc.Payment_FAILED {
+				a.showModal(fmt.Sprintf("Asset payment failed: %s", pr.FailureReason), func() { a.showSend() })
+				return
+			}
 		}
 	}
 }
