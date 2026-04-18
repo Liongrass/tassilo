@@ -22,11 +22,9 @@ import (
 
 // App is the root TUI application.
 type App struct {
-	tapp    *tview.Application
-	clients *client.Clients
-	pages   *tview.Pages
-
-	assets   []*taprpc.Asset
+	tapp     *tview.Application
+	clients  *client.Clients
+	pages    *tview.Pages
 	nodeInfo *lnrpc.GetInfoResponse
 }
 
@@ -94,11 +92,6 @@ func (a *App) loadInitialData() error {
 		return fmt.Errorf("get node info: %w", err)
 	}
 	a.nodeInfo = info
-
-	tapResp, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{})
-	if err == nil && tapResp != nil {
-		a.assets = tapResp.Assets
-	}
 	return nil
 }
 
@@ -124,23 +117,25 @@ func (a *App) showDashboard() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	walletBal, _ := a.clients.LN.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
 	chanBal, _ := a.clients.LN.ChannelBalance(ctx, &lnrpc.ChannelBalanceRequest{})
+	walletBal, _ := a.clients.LN.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
+
+	chanAssets, _ := a.clients.Tap.ListBalances(ctx, &taprpc.ListBalancesRequest{
+		GroupBy: &taprpc.ListBalancesRequest_GroupKey{GroupKey: true},
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_ExplicitType{
+				ExplicitType: taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL,
+			},
+		},
+	})
+	onchainGroups, _ := a.clients.Tap.ListGroups(ctx, &taprpc.ListGroupsRequest{})
 
 	header := tview.NewTextView().
 		SetText(fmt.Sprintf(" Tassilo  |  %s  |  %s", a.nodeInfo.Alias, a.nodeInfo.IdentityPubkey[:16]+"…")).
 		SetTextAlign(tview.AlignCenter).
 		SetDynamicColors(true)
 
-	onchainText := fmt.Sprintf(
-		"[yellow]Onchain Bitcoin[-]\n"+
-			"  Confirmed:   [green]%d sat[-]\n"+
-			"  Unconfirmed: [grey]%d sat[-]\n",
-		walletBal.GetConfirmedBalance(),
-		walletBal.GetUnconfirmedBalance(),
-	)
-
-	offchainText := fmt.Sprintf(
+	offchainBTC := fmt.Sprintf(
 		"[yellow]Lightning (BTC)[-]\n"+
 			"  Local:  [green]%d sat[-]\n"+
 			"  Remote: [grey]%d sat[-]\n",
@@ -148,10 +143,20 @@ func (a *App) showDashboard() {
 		chanBal.GetRemoteBalance().GetSat(),
 	)
 
-	assetLines := buildAssetBalanceText(a.assets)
+	offchainAssets := buildOffchainAssetText(chanAssets.GetAssetGroupBalances())
+
+	onchainBTC := fmt.Sprintf(
+		"[yellow]Onchain Bitcoin[-]\n"+
+			"  Confirmed:   [green]%d sat[-]\n"+
+			"  Unconfirmed: [grey]%d sat[-]\n",
+		walletBal.GetConfirmedBalance(),
+		walletBal.GetUnconfirmedBalance(),
+	)
+
+	onchainAssets := buildOnchainAssetText(onchainGroups.GetGroups())
 
 	balanceView := tview.NewTextView().
-		SetText(onchainText + "\n" + offchainText + "\n" + assetLines).
+		SetText(offchainBTC + "\n" + offchainAssets + "\n" + onchainBTC + "\n" + onchainAssets).
 		SetDynamicColors(true).
 		SetWordWrap(true)
 	balanceView.SetBorder(true).SetTitle(" Balances ")
@@ -187,31 +192,42 @@ func (a *App) showDashboard() {
 	a.pages.AddAndSwitchToPage("dashboard", flex, true)
 }
 
-func buildAssetBalanceText(assets []*taprpc.Asset) string {
-	if len(assets) == 0 {
-		return "[yellow]Taproot Assets[-]\n  (none)\n"
+func buildOffchainAssetText(balances map[string]*taprpc.AssetGroupBalance) string {
+	if len(balances) == 0 {
+		return "[yellow]Lightning (Assets)[-]\n  (none)\n"
 	}
-
-	type entry struct {
-		name   string
-		amount uint64
-	}
-	totals := make(map[string]*entry)
-	for _, asset := range assets {
-		id := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
-		if len(id) > 16 {
-			id = id[:16]
-		}
-		if _, ok := totals[id]; !ok {
-			totals[id] = &entry{name: asset.AssetGenesis.Name}
-		}
-		totals[id].amount += asset.Amount
-	}
-
 	var sb strings.Builder
-	sb.WriteString("[yellow]Taproot Assets[-]\n")
-	for id, e := range totals {
-		sb.WriteString(fmt.Sprintf("  %-20s [green]%d[-]  (id: %s…)\n", e.name, e.amount, id))
+	sb.WriteString("[yellow]Lightning (Assets)[-]\n")
+	for groupKey, bal := range balances {
+		key := groupKey
+		if len(key) > 16 {
+			key = key[:16] + "…"
+		}
+		sb.WriteString(fmt.Sprintf("  [green]%d[-]  (group: %s)\n", bal.Balance, key))
+	}
+	return sb.String()
+}
+
+func buildOnchainAssetText(groups map[string]*taprpc.GroupedAssets) string {
+	if len(groups) == 0 {
+		return "[yellow]Onchain (Assets)[-]\n  (none)\n"
+	}
+	var sb strings.Builder
+	sb.WriteString("[yellow]Onchain (Assets)[-]\n")
+	for groupKey, group := range groups {
+		key := groupKey
+		if len(key) > 16 {
+			key = key[:16] + "…"
+		}
+		var total uint64
+		var name string
+		for _, asset := range group.Assets {
+			total += asset.Amount
+			if name == "" {
+				name = asset.Tag
+			}
+		}
+		sb.WriteString(fmt.Sprintf("  %-20s [green]%d[-]  (group: %s)\n", name, total, key))
 	}
 	return sb.String()
 }
@@ -482,7 +498,11 @@ func (a *App) showAssets() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	resp, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{})
+	resp, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+		},
+	})
 
 	var text string
 	if err != nil {
