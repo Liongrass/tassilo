@@ -122,7 +122,11 @@ func (a *App) showDashboard() {
 	walletBal, _ := a.clients.LN.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
 
 	chanList, _ := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
-	assetList, _ := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{})
+	assetList, _ := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+		},
+	})
 
 	header := tview.NewTextView().
 		SetText(fmt.Sprintf(" Tassilo  |  %s  |  %s", a.nodeInfo.Alias, a.nodeInfo.IdentityPubkey[:16]+"…")).
@@ -137,11 +141,9 @@ func (a *App) showDashboard() {
 		formatCommas(chanBal.GetRemoteBalance().GetSat()),
 	)
 
-	onchainGroups := buildOnchainAssetGroups(assetList.GetAssets())
-	decimalByGroup := make(map[string]uint32, len(onchainGroups))
-	for key, g := range onchainGroups {
-		decimalByGroup[key] = g.decimalDisplay
-	}
+	allAssets := assetList.GetAssets()
+	onchainGroups := buildOnchainAssetGroups(allAssets)
+	decimalByGroup := buildDecimalMap(allAssets)
 
 	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()), decimalByGroup)
 
@@ -230,12 +232,38 @@ type onchainAssetGroup struct {
 	decimalDisplay uint32
 }
 
-// buildOnchainAssetGroups aggregates wallet assets by group key (or asset ID
-// for ungrouped assets), capturing the name and decimal_display from the first
-// asset seen in each group.
+// buildDecimalMap returns a group-key → decimalDisplay map for all assets,
+// including channel assets, so offchain balances can look up the right scale.
+func buildDecimalMap(assets []*taprpc.Asset) map[string]uint32 {
+	m := make(map[string]uint32)
+	for _, a := range assets {
+		var key string
+		if a.AssetGroup != nil && len(a.AssetGroup.TweakedGroupKey) > 0 {
+			key = fmt.Sprintf("%x", a.AssetGroup.TweakedGroupKey)
+		} else {
+			key = fmt.Sprintf("%x", a.AssetGenesis.AssetId)
+		}
+		if _, exists := m[key]; !exists {
+			dd := uint32(0)
+			if a.DecimalDisplay != nil {
+				dd = a.DecimalDisplay.DecimalDisplay
+			}
+			m[key] = dd
+		}
+	}
+	return m
+}
+
+// buildOnchainAssetGroups aggregates wallet (non-channel) assets by group key
+// (or asset ID for ungrouped assets), capturing the name and decimal_display
+// from the first asset seen in each group.
 func buildOnchainAssetGroups(assets []*taprpc.Asset) map[string]*onchainAssetGroup {
 	groups := make(map[string]*onchainAssetGroup)
 	for _, a := range assets {
+		// Skip assets locked in channels — those belong in the offchain section.
+		if a.ScriptKeyType == taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL {
+			continue
+		}
 		var key string
 		if a.AssetGroup != nil && len(a.AssetGroup.TweakedGroupKey) > 0 {
 			key = fmt.Sprintf("%x", a.AssetGroup.TweakedGroupKey)
@@ -311,21 +339,19 @@ func formatCommas[T uint64 | int64](n T) string {
 	return string(out)
 }
 
-// formatAssetAmount divides amount by decimalDisplay and formats with commas.
-// decimalDisplay == 0 means no scaling.
+// formatAssetAmount scales amount by 10^decimalDisplay and formats with commas.
+// decimalDisplay is the number of decimal places (e.g. 2 → divide by 100).
 func formatAssetAmount(amount uint64, decimalDisplay uint32) string {
 	if decimalDisplay == 0 {
 		return formatCommas(amount)
 	}
-	div := uint64(decimalDisplay)
+	div := uint64(1)
+	for i := uint32(0); i < decimalDisplay; i++ {
+		div *= 10
+	}
 	whole := amount / div
 	frac := amount % div
-	// Determine how many decimal places decimalDisplay represents.
-	places := 0
-	for d := div; d >= 10; d /= 10 {
-		places++
-	}
-	return fmt.Sprintf("%s.%0*d", formatCommas(whole), places, frac)
+	return fmt.Sprintf("%s.%0*d", formatCommas(whole), int(decimalDisplay), frac)
 }
 
 func (a *App) showReceive() {
