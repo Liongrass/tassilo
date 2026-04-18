@@ -64,7 +64,7 @@ func main() {
 }
 
 func runTUI(cfg *config.Config) error {
-	fmt.Println("Connecting to litd and baking supermacaroon…")
+	fmt.Println("Connecting to litd…")
 
 	clients, err := client.Connect(cfg)
 	if err != nil {
