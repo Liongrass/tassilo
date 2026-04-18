@@ -143,9 +143,9 @@ func (a *App) showDashboard() {
 
 	allAssets := assetList.GetAssets()
 	onchainGroups := buildOnchainAssetGroups(allAssets)
-	decimalByGroup := buildDecimalMap(allAssets)
+	groupMetas := buildGroupMetaMap(allAssets)
 
-	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()), decimalByGroup)
+	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()), groupMetas)
 
 	onchainBTC := fmt.Sprintf(
 		"[yellow]Onchain Bitcoin[-]\n"+
@@ -232,10 +232,16 @@ type onchainAssetGroup struct {
 	decimalDisplay uint32
 }
 
-// buildDecimalMap returns a group-key → decimalDisplay map for all assets,
-// including channel assets, so offchain balances can look up the right scale.
-func buildDecimalMap(assets []*taprpc.Asset) map[string]uint32 {
-	m := make(map[string]uint32)
+type groupMeta struct {
+	name           string
+	decimalDisplay uint32
+}
+
+// buildGroupMetaMap returns a group-key → {name, decimalDisplay} map for all
+// assets (including channel assets) so both sections can look up the right
+// display name and scale factor.
+func buildGroupMetaMap(assets []*taprpc.Asset) map[string]*groupMeta {
+	m := make(map[string]*groupMeta)
 	for _, a := range assets {
 		var key string
 		if a.AssetGroup != nil && len(a.AssetGroup.TweakedGroupKey) > 0 {
@@ -248,7 +254,7 @@ func buildDecimalMap(assets []*taprpc.Asset) map[string]uint32 {
 			if a.DecimalDisplay != nil {
 				dd = a.DecimalDisplay.DecimalDisplay
 			}
-			m[key] = dd
+			m[key] = &groupMeta{name: a.AssetGenesis.Name, decimalDisplay: dd}
 		}
 	}
 	return m
@@ -285,23 +291,26 @@ func buildOnchainAssetGroups(assets []*taprpc.Asset) map[string]*onchainAssetGro
 	return groups
 }
 
-func buildOffchainAssetText(balances map[string]*assetGroupBalance, decimalByGroup map[string]uint32) string {
+func buildOffchainAssetText(balances map[string]*assetGroupBalance, metas map[string]*groupMeta) string {
 	if len(balances) == 0 {
 		return "[yellow]Lightning (Assets)[-]\n  (none)\n"
 	}
 	var sb strings.Builder
 	sb.WriteString("[yellow]Lightning (Assets)[-]\n")
 	for groupKey, bal := range balances {
-		dd := decimalByGroup[groupKey]
-		key := groupKey
-		if len(key) > 16 {
-			key = key[:16] + "…"
+		name := groupKey
+		dd := uint32(0)
+		if m, ok := metas[groupKey]; ok {
+			name = m.name
+			dd = m.decimalDisplay
 		}
 		sb.WriteString(fmt.Sprintf(
-			"  Local:  [green]%s[-]\n  Remote: [grey]%s[-]  (group: %s)\n",
+			"  [cyan]%s[-]\n"+
+				"    Local:  [green]%s[-]\n"+
+				"    Remote: [grey]%s[-]\n",
+			name,
 			formatAssetAmount(bal.local, dd),
 			formatAssetAmount(bal.remote, dd),
-			key,
 		))
 	}
 	return sb.String()
@@ -313,14 +322,10 @@ func buildOnchainAssetText(groups map[string]*onchainAssetGroup) string {
 	}
 	var sb strings.Builder
 	sb.WriteString("[yellow]Onchain (Assets)[-]\n")
-	for groupKey, g := range groups {
-		key := groupKey
-		if len(key) > 16 {
-			key = key[:16] + "…"
-		}
+	for _, g := range groups {
 		sb.WriteString(fmt.Sprintf(
-			"  %-20s [green]%s[-]  (group: %s)\n",
-			g.name, formatAssetAmount(g.amount, g.decimalDisplay), key,
+			"  [cyan]%-20s[-]  [green]%s[-]\n",
+			g.name, formatAssetAmount(g.amount, g.decimalDisplay),
 		))
 	}
 	return sb.String()
