@@ -361,19 +361,58 @@ func formatAssetAmount(amount uint64, decimalDisplay uint32) string {
 }
 
 func (a *App) showReceive() {
+	var selectedAssetID string // hex asset ID; empty = BTC
+	var amountStr, memoStr string
+	var settingFromPicker bool
+
+	assetField := tview.NewInputField().
+		SetLabel("Asset").
+		SetFieldWidth(40).
+		SetPlaceholder("BTC  (press Enter to pick)")
+	assetField.SetChangedFunc(func(t string) {
+		if !settingFromPicker {
+			// user typed manually — treat as raw hex ID
+			selectedAssetID = t
+		}
+	})
+
 	form := tview.NewForm()
-
-	var assetID, amountStr, memoStr string
-
-	form.AddInputField("Asset ID (hex, empty=BTC)", "", 64, nil, func(t string) { assetID = t }).
-		AddInputField("Amount (asset units or sat)", "", 20, nil, func(t string) { amountStr = t }).
+	form.AddFormItem(assetField).
+		AddInputField("Amount (units or sat)", "", 20, nil, func(t string) { amountStr = t }).
 		AddInputField("Memo (optional)", "", 60, nil, func(t string) { memoStr = t }).
 		AddButton("Generate", func() {
-			a.doCreateInvoice(assetID, amountStr, memoStr)
+			a.doCreateInvoice(selectedAssetID, amountStr, memoStr)
 		}).
 		AddButton("Back", func() { a.showDashboard() })
-
 	form.SetBorder(true).SetTitle(" Receive — Create Invoice (Esc=back) ")
+
+	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			a.showAssetPicker(func(name, id string) {
+				if name == "" {
+					// cancelled — leave current selection unchanged
+					a.tapp.SetFocus(form)
+					return
+				}
+				settingFromPicker = true
+				if id == "" {
+					assetField.SetText("") // BTC: show placeholder
+				} else {
+					assetField.SetText(name)
+				}
+				settingFromPicker = false
+				selectedAssetID = id
+				a.tapp.SetFocus(form)
+			})
+			return nil
+		case tcell.KeyEscape:
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
+
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
@@ -382,6 +421,69 @@ func (a *App) showReceive() {
 		return event
 	})
 	a.pages.AddAndSwitchToPage("receive", form, true)
+}
+
+func (a *App) showAssetPicker(done func(name, assetIDHex string)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, _ := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+		},
+	})
+
+	type assetOption struct {
+		name    string
+		assetID string // hex genesis ID
+	}
+	var options []assetOption
+	seen := make(map[string]bool)
+	for _, asset := range resp.GetAssets() {
+		if asset.ScriptKeyType != taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL {
+			continue
+		}
+		var groupKey string
+		if asset.AssetGroup != nil && len(asset.AssetGroup.TweakedGroupKey) > 0 {
+			groupKey = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
+		} else {
+			groupKey = fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
+		}
+		if seen[groupKey] {
+			continue
+		}
+		seen[groupKey] = true
+		options = append(options, assetOption{
+			name:    asset.AssetGenesis.Name,
+			assetID: fmt.Sprintf("%x", asset.AssetGenesis.AssetId),
+		})
+	}
+	sort.Slice(options, func(i, j int) bool {
+		return options[i].name < options[j].name
+	})
+
+	list := tview.NewList()
+	list.AddItem("BTC", "Bitcoin — no asset", 0, func() {
+		a.pages.SwitchToPage("receive")
+		done("BTC", "")
+	})
+	for _, opt := range options {
+		opt := opt
+		list.AddItem(opt.name, opt.assetID, 0, func() {
+			a.pages.SwitchToPage("receive")
+			done(opt.name, opt.assetID)
+		})
+	}
+	list.SetBorder(true).SetTitle(" Select Asset (Esc=cancel) ")
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.pages.SwitchToPage("receive")
+			done("", "") // cancel
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("assetpicker", list, true)
 }
 
 func (a *App) doCreateInvoice(assetID, amountStr, memo string) {
