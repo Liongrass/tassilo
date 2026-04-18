@@ -637,7 +637,7 @@ func (a *App) showPaymentMethodPicker(payReq string) {
 	list := tview.NewList()
 	btcLocal := chanBal.GetLocalBalance().GetSat()
 	list.AddItem("Bitcoin", fmt.Sprintf("%s sat local", formatCommas(btcLocal)), 0, func() {
-		a.doSendBTC(payReq)
+		a.showPaymentConfirmation(payReq, "Bitcoin", "", func() { a.doSendBTC(payReq) })
 	})
 	for _, e := range entries {
 		e := e
@@ -645,7 +645,9 @@ func (a *App) showPaymentMethodPicker(payReq string) {
 			e.name,
 			fmt.Sprintf("%s local", formatAssetAmount(e.local, e.decimalDisplay)),
 			0,
-			func() { a.doSendAsset(payReq, e.groupKeyHex) },
+			func() {
+				a.showPaymentConfirmation(payReq, e.name, e.groupKeyHex, func() { a.doSendAsset(payReq, e.groupKeyHex) })
+			},
 		)
 	}
 
@@ -658,6 +660,70 @@ func (a *App) showPaymentMethodPicker(payReq string) {
 		return event
 	})
 	a.pages.AddAndSwitchToPage("paywith", list, true)
+}
+
+func (a *App) showPaymentConfirmation(payReq, assetName, groupKeyHex string, onConfirm func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var sb strings.Builder
+	sb.WriteString("[yellow]Payment Summary[-]\n\n")
+
+	decoded, err := a.clients.LN.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: payReq})
+	if err != nil {
+		sb.WriteString(fmt.Sprintf("[red]Could not decode invoice: %v[-]\n\n", err))
+	} else {
+		sb.WriteString(fmt.Sprintf("Destination:  [cyan]%s[-]\n", decoded.Destination))
+		if decoded.Description != "" {
+			sb.WriteString(fmt.Sprintf("Description:  %s\n", decoded.Description))
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("Pay with:     [cyan]%s[-]\n", assetName))
+
+	if groupKeyHex == "" {
+		// BTC payment — amount comes from the decoded invoice.
+		if err == nil {
+			sb.WriteString(fmt.Sprintf("Amount:       [green]%s sat[-]\n", formatCommas(uint64(decoded.NumSatoshis))))
+		}
+	} else {
+		// Asset payment — ask tapd to decode the asset-specific fields.
+		groupKeyBytes, hexErr := hexToBytes(groupKeyHex)
+		if hexErr == nil {
+			assetResp, assetErr := a.clients.TapChannel.DecodeAssetPayReq(ctx, &tapchannelrpc.AssetPayReq{
+				PayReqString: payReq,
+				GroupKey:     groupKeyBytes,
+			})
+			if assetErr == nil {
+				dd := uint32(0)
+				if assetResp.DecimalDisplay != nil {
+					dd = assetResp.DecimalDisplay.DecimalDisplay
+				}
+				sb.WriteString(fmt.Sprintf("Amount:       [green]%s[-]\n", formatAssetAmount(assetResp.AssetAmount, dd)))
+			} else {
+				sb.WriteString(fmt.Sprintf("Amount:       [grey]could not decode: %v[-]\n", assetErr))
+			}
+		}
+	}
+
+	sb.WriteString("\n[grey]Enter to confirm  ·  Esc to go back[-]")
+
+	tv := tview.NewTextView().
+		SetText(sb.String()).
+		SetDynamicColors(true)
+	tv.SetBorder(true).SetTitle(" Confirm Payment ")
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			onConfirm()
+			return nil
+		case tcell.KeyEscape:
+			a.showPaymentMethodPicker(payReq)
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("payconfirm", tv, true)
 }
 
 func (a *App) doSendBTC(payReq string) {
