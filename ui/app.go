@@ -387,9 +387,8 @@ func (a *App) showReceive() {
 		AddInputField("Memo (optional)", "", 60, nil, func(t string) { memoStr = t }).
 		AddButton("Generate", func() {
 			a.doCreateInvoice(selectedAssetIDHex, selectedGroupKeyHex, selectedDecimal, amountStr, memoStr)
-		}).
-		AddButton("Back", func() { a.showDashboard() })
-	form.SetBorder(true).SetTitle(" Receive — Create Invoice (Esc=back) ")
+		})
+	form.SetBorder(true).SetTitle(" Receive — Create Invoice ")
 
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -593,10 +592,9 @@ func (a *App) showSend() {
 				return
 			}
 			a.showPaymentMethodPicker(payReqStr)
-		}).
-		AddButton("Back", func() { a.showDashboard() })
+		})
 
-	form.SetBorder(true).SetTitle(" Send — Pay Invoice (Esc=back) ")
+	form.SetBorder(true).SetTitle(" Send — Pay Invoice ")
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
@@ -754,10 +752,9 @@ func (a *App) showOpenChannel() {
 		AddInputField("Fee rate (sat/vbyte, optional)", "", 10, nil, func(t string) { feeRateStr = t }).
 		AddButton("Open", func() {
 			a.doOpenChannel(peerPubkey, localAmtStr, assetID, assetAmtStr, feeRateStr)
-		}).
-		AddButton("Back", func() { a.showDashboard() })
+		})
 
-	form.SetBorder(true).SetTitle(" Open Channel (Esc=back) ")
+	form.SetBorder(true).SetTitle(" Open Channel ")
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
