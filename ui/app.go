@@ -176,13 +176,6 @@ func (a *App) showDashboard() {
 		}).
 		AddItem("Quit", "Exit Tassilo", 'q', func() { a.tapp.Stop() })
 	menu.SetBorder(true).SetTitle(" Actions ")
-	menu.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			a.tapp.Stop()
-			return nil
-		}
-		return event
-	})
 
 	flex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(header, 1, 0, false).
