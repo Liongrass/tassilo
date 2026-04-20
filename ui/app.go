@@ -840,6 +840,27 @@ func (a *App) doSendAsset(payReq, groupKeyHex string) {
 	}
 }
 
+// parsePaymentAsset tries to decode tapd's JSON-encoded asset payment data from
+// a Route or InvoiceHTLC CustomChannelData blob. On success it returns the
+// asset name, raw amount, decimal display, and true.
+func parsePaymentAsset(data []byte, metaByKey map[string]*groupMeta) (name string, amt uint64, dd uint32, ok bool) {
+	if len(data) == 0 {
+		return
+	}
+	var wrapper struct {
+		AssetAmounts map[string]uint64 `json:"asset_amounts"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil || len(wrapper.AssetAmounts) == 0 {
+		return
+	}
+	for key, amount := range wrapper.AssetAmounts {
+		if m, found := metaByKey[key]; found {
+			return m.name, amount, m.decimalDisplay, true
+		}
+	}
+	return
+}
+
 // paymentEntry is a unified record from any payment source.
 type paymentEntry struct {
 	ts        int64  // unix seconds
@@ -899,7 +920,8 @@ func (a *App) showPayments() {
 		}
 	}
 
-	// Asset transfers — build name lookup from all known assets.
+	// Build asset metadata maps for both group-key and asset-ID lookups.
+	var allAssets []*taprpc.Asset
 	assetIDToMeta := make(map[string]struct {
 		name string
 		dd   uint32
@@ -909,7 +931,8 @@ func (a *App) showPayments() {
 			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
 		},
 	}); err == nil {
-		for _, asset := range al.GetAssets() {
+		allAssets = al.GetAssets()
+		for _, asset := range allAssets {
 			key := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
 			if _, exists := assetIDToMeta[key]; !exists {
 				dd := uint32(0)
@@ -920,6 +943,37 @@ func (a *App) showPayments() {
 					name string
 					dd   uint32
 				}{asset.AssetGenesis.Name, dd}
+			}
+		}
+	}
+	metaByKey := buildGroupMetaMap(allAssets)
+
+	// Back-fill asset info for LN payments with CustomChannelData.
+	for i := range entries {
+		e := &entries[i]
+		if e.kind == "ln_out" && e.lnOut != nil {
+			for _, htlc := range e.lnOut.Htlcs {
+				if htlc.Status != lnrpc.HTLCAttempt_SUCCEEDED {
+					continue
+				}
+				if htlc.Route == nil {
+					continue
+				}
+				if name, amt, dd, found := parsePaymentAsset(htlc.Route.CustomChannelData, metaByKey); found {
+					e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+					break
+				}
+			}
+		}
+		if e.kind == "ln_in" && e.lnIn != nil {
+			for _, htlc := range e.lnIn.Htlcs {
+				if htlc.State != lnrpc.InvoiceHTLCState_SETTLED {
+					continue
+				}
+				if name, amt, dd, found := parsePaymentAsset(htlc.CustomChannelData, metaByKey); found {
+					e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+					break
+				}
 			}
 		}
 	}
@@ -985,7 +1039,7 @@ func (a *App) showPayments() {
 		ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
 
 		var amtStr string
-		if e.kind == "asset" {
+		if e.assetName != "BTC" {
 			amtStr = formatAssetAmount(e.amtAsset, e.decDisp)
 		} else {
 			sat := e.amtMsat / 1000
@@ -1002,12 +1056,25 @@ func (a *App) showPayments() {
 			prefix = "-"
 		}
 
-		typeLabel := map[string]string{
-			"ln_out":  "Lightning out",
-			"ln_in":   "Lightning in",
-			"onchain": "Onchain",
-			"asset":   "Asset",
-		}[e.kind]
+		var typeLabel string
+		switch e.kind {
+		case "ln_out":
+			if e.assetName != "BTC" {
+				typeLabel = "Lightning out (asset)"
+			} else {
+				typeLabel = "Lightning out"
+			}
+		case "ln_in":
+			if e.assetName != "BTC" {
+				typeLabel = "Lightning in (asset)"
+			} else {
+				typeLabel = "Lightning in"
+			}
+		case "onchain":
+			typeLabel = "Onchain"
+		case "asset":
+			typeLabel = "Asset"
+		}
 
 		table.SetCell(row, 0, tview.NewTableCell(ts))
 		table.SetCell(row, 1, tview.NewTableCell(color+prefix+amtStr+"[-]"))
@@ -1045,7 +1112,11 @@ func (a *App) showPaymentDetail(e paymentEntry) {
 		p := e.lnOut
 		sb.WriteString("[yellow]Outgoing Lightning Payment[-]\n\n")
 		sb.WriteString(fmt.Sprintf("Date:     %s\n", ts))
-		sb.WriteString(fmt.Sprintf("Amount:   [red]-%s sat[-]\n", formatCommas(uint64(p.ValueSat))))
+		if e.assetName != "BTC" {
+			sb.WriteString(fmt.Sprintf("Amount:   [red]-%s %s[-]\n", formatAssetAmount(e.amtAsset, e.decDisp), e.assetName))
+		} else {
+			sb.WriteString(fmt.Sprintf("Amount:   [red]-%s sat[-]\n", formatCommas(uint64(p.ValueSat))))
+		}
 		sb.WriteString(fmt.Sprintf("Fee:      %s sat\n", formatCommas(uint64(p.FeeSat))))
 		sb.WriteString(fmt.Sprintf("Status:   %s\n", p.Status))
 		sb.WriteString(fmt.Sprintf("Hash:     %s\n", p.PaymentHash))
@@ -1064,7 +1135,11 @@ func (a *App) showPaymentDetail(e paymentEntry) {
 		}
 		sb.WriteString("[yellow]Incoming Lightning Payment[-]\n\n")
 		sb.WriteString(fmt.Sprintf("Date:     %s\n", ts))
-		sb.WriteString(fmt.Sprintf("Amount:   [green]+%s sat[-]\n", formatCommas(uint64(inv.AmtPaidSat))))
+		if e.assetName != "BTC" {
+			sb.WriteString(fmt.Sprintf("Amount:   [green]+%s %s[-]\n", formatAssetAmount(e.amtAsset, e.decDisp), e.assetName))
+		} else {
+			sb.WriteString(fmt.Sprintf("Amount:   [green]+%s sat[-]\n", formatCommas(uint64(inv.AmtPaidSat))))
+		}
 		if inv.Memo != "" {
 			sb.WriteString(fmt.Sprintf("Memo:     %s\n", inv.Memo))
 		}
