@@ -326,6 +326,46 @@ func buildOnchainAssetText(groups map[string]*onchainAssetGroup) string {
 	return sb.String()
 }
 
+// parseScaledAmount parses a decimal string and returns it scaled by 10^scale,
+// using integer arithmetic throughout to avoid floating-point rounding.
+// Examples: ("21.5", 3) → 21500   ("1000", 3) → 1000000   ("0.001", 3) → 1
+func parseScaledAmount(s string, scale uint32) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty amount")
+	}
+	parts := strings.SplitN(s, ".", 2)
+
+	whole, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid amount")
+	}
+
+	multiplier := uint64(1)
+	for i := uint32(0); i < scale; i++ {
+		multiplier *= 10
+	}
+	result := whole * multiplier
+
+	if len(parts) == 2 && scale > 0 && parts[1] != "" {
+		frac := parts[1]
+		// Truncate extra digits beyond scale; pad if shorter.
+		if uint32(len(frac)) > scale {
+			frac = frac[:scale]
+		} else {
+			for uint32(len(frac)) < scale {
+				frac += "0"
+			}
+		}
+		fracVal, err := strconv.ParseUint(frac, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid decimal part")
+		}
+		result += fracVal
+	}
+	return result, nil
+}
+
 // formatCommas inserts thousand separators into an integer.
 func formatCommas[T uint64 | int64](n T) string {
 	s := fmt.Sprintf("%d", n)
@@ -376,7 +416,7 @@ func (a *App) showReceive() {
 
 	form := tview.NewForm()
 	form.AddFormItem(assetField).
-		AddInputField("Amount (units or sat)", "", 20, nil, func(t string) { amountStr = t }).
+		AddInputField("Amount", "", 20, nil, func(t string) { amountStr = t }).
 		AddInputField("Memo (optional)", "", 60, nil, func(t string) { memoStr = t }).
 		AddButton("Generate", func() {
 			a.doCreateInvoice(selectedAssetIDHex, selectedGroupKeyHex, selectedDecimal, amountStr, memoStr)
@@ -502,12 +542,6 @@ func (a *App) showAssetPicker(done func(name, assetIDHex, groupKeyHex string, de
 }
 
 func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uint32, amountStr, memo string) {
-	amount, err := strconv.ParseUint(amountStr, 10, 64)
-	if err != nil || amount == 0 {
-		a.showModal("Invalid amount.", func() { a.showReceive() })
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -515,9 +549,15 @@ func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uin
 
 	isBTC := assetIDHex == "" && groupKeyHex == ""
 	if isBTC {
+		// Parse as satoshis; decimal part maps to millisatoshis (scale=3).
+		valueMsat, err := parseScaledAmount(amountStr, 3)
+		if err != nil || valueMsat == 0 {
+			a.showModal("Invalid amount.", func() { a.showReceive() })
+			return
+		}
 		resp, err := a.clients.LN.AddInvoice(ctx, &lnrpc.Invoice{
-			Memo:  memo,
-			Value: int64(amount),
+			Memo:      memo,
+			ValueMsat: int64(valueMsat),
 		})
 		if err != nil {
 			a.showModal(fmt.Sprintf("Error: %v", err), func() { a.showReceive() })
@@ -525,14 +565,15 @@ func (a *App) doCreateInvoice(assetIDHex, groupKeyHex string, decimalDisplay uin
 		}
 		payReq = resp.PaymentRequest
 	} else {
-		// Scale the human-readable amount by 10^decimalDisplay.
-		scaledAmount := amount
-		for i := uint32(0); i < decimalDisplay; i++ {
-			scaledAmount *= 10
+		// Parse display units; decimal part maps to sub-units via decimalDisplay.
+		scaledAmount, err := parseScaledAmount(amountStr, decimalDisplay)
+		if err != nil || scaledAmount == 0 {
+			a.showModal("Invalid amount.", func() { a.showReceive() })
+			return
 		}
 
 		req := &tapchannelrpc.AddInvoiceRequest{
-			AssetAmount: scaledAmount,
+			AssetAmount: scaledAmount, // already scaled by parseScaledAmount
 			InvoiceRequest: &lnrpc.Invoice{
 				Memo: memo,
 			},
