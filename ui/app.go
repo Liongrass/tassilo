@@ -1451,16 +1451,20 @@ func (a *App) showPayments() {
 			return nil
 		}
 		// Load older payments when the user reaches the last row.
+		// Always consume the event at the last row to prevent tview wrap-around.
 		if event.Key() == tcell.KeyDown || event.Rune() == 'j' {
 			row, _ := table.GetSelection()
-			if row >= table.GetRowCount()-1 && (lnOutCursor > 0 || lnInCursor > 0) {
-				prevLen := len(entries)
-				loadLNOut()
-				loadLNIn()
-				backfillFrom(prevLen)
-				sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
-				rebuildTable()
-				table.Select(row, 0)
+			if row >= table.GetRowCount()-1 {
+				if lnOutCursor > 0 || lnInCursor > 0 {
+					prevLen := len(entries)
+					loadLNOut()
+					loadLNIn()
+					backfillFrom(prevLen)
+					sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
+					rebuildTable()
+					table.Select(row, 0)
+				}
+				return nil
 			}
 		}
 		return event
