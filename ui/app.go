@@ -1104,7 +1104,7 @@ func (a *App) showPayments() {
 	backfillFrom(0)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
 
-	headers := []string{"Date", "Amount", "Asset", "Type"}
+	headers := []string{"Date", "Amount", "Asset", "", "Memo"}
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 
 	rebuildTable := func() {
@@ -1132,14 +1132,22 @@ func (a *App) showPayments() {
 				color = "[red]"
 				prefix = "-"
 			}
-			typeLabel := map[string]string{
-				"ln_out": "Lightning", "ln_in": "Lightning",
-				"onchain": "Onchain", "asset": "Onchain",
+			typeEmoji := map[string]string{
+				"ln_out": "⚡", "ln_in": "⚡",
+				"onchain": "⛓️", "asset": "⛓️",
 			}[e.kind]
+			var memo string
+			switch e.kind {
+			case "ln_in":
+				memo = e.lnIn.Memo
+			case "onchain":
+				memo = e.onchain.Label
+			}
 			table.SetCell(row, 0, tview.NewTableCell(ts))
 			table.SetCell(row, 1, tview.NewTableCell(color+prefix+amtStr+"[-]"))
 			table.SetCell(row, 2, tview.NewTableCell(e.assetName))
-			table.SetCell(row, 3, tview.NewTableCell(typeLabel))
+			table.SetCell(row, 3, tview.NewTableCell(typeEmoji))
+			table.SetCell(row, 4, tview.NewTableCell(memo))
 		}
 		table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 	}
