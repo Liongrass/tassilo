@@ -1006,6 +1006,21 @@ func (a *App) showChannels() {
 		return rows[i].assetName < rows[j].assetName
 	})
 
+	// Resolve peer aliases — one GetNodeInfo call per unique pubkey.
+	peerAlias := make(map[string]string)
+	for _, row := range rows {
+		pk := row.ch.RemotePubkey
+		if _, seen := peerAlias[pk]; seen {
+			continue
+		}
+		info, err := a.clients.LN.GetNodeInfo(ctx, &lnrpc.NodeInfoRequest{PubKey: pk})
+		if err == nil && info.Node != nil && info.Node.Alias != "" {
+			peerAlias[pk] = info.Node.Alias
+		} else {
+			peerAlias[pk] = pk[:12] + "…" + pk[len(pk)-8:]
+		}
+	}
+
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 
 	hdr := func(s string) *tview.TableCell {
@@ -1020,10 +1035,7 @@ func (a *App) showChannels() {
 	for i, row := range rows {
 		r := i + 1
 
-		peer := row.ch.RemotePubkey
-		if len(peer) > 24 {
-			peer = peer[:12] + "…" + peer[len(peer)-8:]
-		}
+		peer := peerAlias[row.ch.RemotePubkey]
 		peerColor := "[white]"
 		if !row.ch.Active {
 			peerColor = "[grey]"
