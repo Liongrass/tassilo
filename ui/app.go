@@ -231,6 +231,7 @@ type onchainAssetGroup struct {
 type groupMeta struct {
 	name           string
 	decimalDisplay uint32
+	groupKey       []byte // raw bytes; nil for ungrouped assets (keyed by asset ID)
 }
 
 // buildGroupMetaMap returns a group-key → {name, decimalDisplay} map for all
@@ -240,8 +241,10 @@ func buildGroupMetaMap(assets []*taprpc.Asset) map[string]*groupMeta {
 	m := make(map[string]*groupMeta)
 	for _, a := range assets {
 		var key string
+		var gk []byte
 		if a.AssetGroup != nil && len(a.AssetGroup.TweakedGroupKey) > 0 {
-			key = fmt.Sprintf("%x", a.AssetGroup.TweakedGroupKey)
+			gk = a.AssetGroup.TweakedGroupKey
+			key = fmt.Sprintf("%x", gk)
 		} else {
 			key = fmt.Sprintf("%x", a.AssetGenesis.AssetId)
 		}
@@ -250,10 +253,67 @@ func buildGroupMetaMap(assets []*taprpc.Asset) map[string]*groupMeta {
 			if a.DecimalDisplay != nil {
 				dd = a.DecimalDisplay.DecimalDisplay
 			}
-			m[key] = &groupMeta{name: a.AssetGenesis.Name, decimalDisplay: dd}
+			m[key] = &groupMeta{name: a.AssetGenesis.Name, decimalDisplay: dd, groupKey: gk}
 		}
 	}
 	return m
+}
+
+// resolveAssetPayReq decodes a bolt11 pay-req against all known group keys and
+// returns the asset name, raw amount, and decimal display on the first match.
+// It tries without a group key first (tapd may auto-detect), then each known key.
+func (a *App) resolveAssetPayReq(payReq string, metaByKey map[string]*groupMeta) (name string, amt uint64, dd uint32, ok bool) {
+	if payReq == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	decodeWith := func(gk []byte) (string, uint64, uint32, bool) {
+		resp, err := a.clients.TapChannel.DecodeAssetPayReq(ctx, &tapchannelrpc.AssetPayReq{
+			PayReqString: payReq,
+			GroupKey:     gk,
+		})
+		if err != nil {
+			return "", 0, 0, false
+		}
+		var n string
+		if resp.GenesisInfo != nil {
+			n = resp.GenesisInfo.Name
+		}
+		var d uint32
+		if resp.DecimalDisplay != nil {
+			d = resp.DecimalDisplay.DecimalDisplay
+		}
+		// Require at least a name or a non-zero amount to consider it a match.
+		if n == "" && resp.AssetAmount == 0 {
+			return "", 0, 0, false
+		}
+		return n, resp.AssetAmount, d, true
+	}
+
+	// Try without a group key — tapd may resolve it automatically.
+	if n, amount, d, found := decodeWith(nil); found {
+		return n, amount, d, true
+	}
+
+	// Fall back to trying each known group key.
+	for _, meta := range metaByKey {
+		if len(meta.groupKey) == 0 {
+			continue
+		}
+		if n, amount, d, found := decodeWith(meta.groupKey); found {
+			// If genesis name is missing, use the local metadata name.
+			if n == "" {
+				n = meta.name
+			}
+			if d == 0 {
+				d = meta.decimalDisplay
+			}
+			return n, amount, d, true
+		}
+	}
+	return
 }
 
 // buildOnchainAssetGroups aggregates wallet (non-channel) assets by group key
@@ -987,34 +1047,54 @@ func (a *App) showPayments() {
 		}
 	}
 
-	// backfillFrom checks new entries for asset LN payments via CustomChannelData.
+	// backfillFrom identifies asset LN payments. CustomChannelData on the wire is
+	// TLV-encoded (not JSON), so we try JSON first for forward-compat, then fall
+	// back to DecodeAssetPayReq against known group keys.
 	backfillFrom := func(start int) {
 		for i := start; i < len(entries); i++ {
 			e := &entries[i]
 			if e.assetName != "BTC" {
 				continue
 			}
+
+			var customData []byte
+			var payReq string
+
 			if e.kind == "ln_out" && e.lnOut != nil {
+				payReq = e.lnOut.PaymentRequest
 				for _, htlc := range e.lnOut.Htlcs {
-					if htlc.Status != lnrpc.HTLCAttempt_SUCCEEDED || htlc.Route == nil {
-						continue
+					if htlc.Status == lnrpc.HTLCAttempt_SUCCEEDED && htlc.Route != nil {
+						customData = htlc.Route.CustomChannelData
+						break
 					}
-					if name, amt, dd, found := parsePaymentAsset(htlc.Route.CustomChannelData, metaByKey); found {
-						e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+				}
+			} else if e.kind == "ln_in" && e.lnIn != nil {
+				payReq = e.lnIn.PaymentRequest
+				for _, htlc := range e.lnIn.Htlcs {
+					if htlc.State == lnrpc.InvoiceHTLCState_SETTLED {
+						customData = htlc.CustomChannelData
 						break
 					}
 				}
 			}
-			if e.kind == "ln_in" && e.lnIn != nil {
-				for _, htlc := range e.lnIn.Htlcs {
-					if htlc.State != lnrpc.InvoiceHTLCState_SETTLED {
-						continue
-					}
-					if name, amt, dd, found := parsePaymentAsset(htlc.CustomChannelData, metaByKey); found {
-						e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
-						break
-					}
-				}
+
+			if len(customData) == 0 {
+				continue
+			}
+
+			// Try JSON (works if tapd serialises as JSON in future / different builds).
+			if name, amt, dd, found := parsePaymentAsset(customData, metaByKey); found {
+				e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+				continue
+			}
+
+			// CustomChannelData is TLV — decode via DecodeAssetPayReq on the invoice.
+			if name, amt, dd, found := a.resolveAssetPayReq(payReq, metaByKey); found {
+				e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+			} else {
+				// Known TAP payment but asset unresolvable — at least not BTC.
+				e.assetName = "Asset"
+				e.amtMsat = 0
 			}
 		}
 	}
@@ -1139,14 +1219,17 @@ func (a *App) showPayments() {
 			row := i + 1
 			ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
 			var rawAmt string
-			if e.assetName != "BTC" {
-				rawAmt = formatAssetAmount(e.amtAsset, e.decDisp)
-			} else {
+			switch {
+			case e.assetName == "BTC":
 				sat := e.amtMsat / 1000
 				if sat < 0 {
 					sat = -sat
 				}
 				rawAmt = formatCommas(uint64(sat))
+			case e.amtAsset > 0:
+				rawAmt = formatAssetAmount(e.amtAsset, e.decDisp)
+			default:
+				rawAmt = "?" // TAP payment detected but amount unresolved
 			}
 			color := "[green]"
 			prefix := "+"
