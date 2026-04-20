@@ -882,30 +882,54 @@ func (a *App) showPayments() {
 
 	var entries []paymentEntry
 
-	// Outgoing LN payments (succeeded only).
-	if pmts, err := a.clients.LN.ListPayments(ctx, &lnrpc.ListPaymentsRequest{}); err == nil {
+	// Outgoing LN payments (succeeded only) — paginate to get all.
+	for offset := uint64(0); ; {
+		pmts, err := a.clients.LN.ListPayments(ctx, &lnrpc.ListPaymentsRequest{
+			IndexOffset: offset,
+			MaxPayments: 1000,
+		})
+		if err != nil || len(pmts.GetPayments()) == 0 {
+			break
+		}
 		for _, p := range pmts.GetPayments() {
 			if p.Status == lnrpc.Payment_SUCCEEDED {
 				entries = append(entries, paymentEntry{
-					ts: p.CreationTimeNs / 1_000_000_000,
-					incoming: false, amtMsat: p.ValueMsat,
+					ts:        p.CreationTimeNs / 1_000_000_000,
+					incoming:  false, amtMsat: p.ValueMsat,
 					assetName: "BTC", kind: "ln_out", lnOut: p,
 				})
 			}
 		}
+		next := pmts.GetLastIndexOffset()
+		if next <= offset {
+			break
+		}
+		offset = next
 	}
 
-	// Incoming LN invoices (settled only).
-	if invs, err := a.clients.LN.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{}); err == nil {
+	// Incoming LN invoices (settled only) — paginate to get all.
+	for offset := uint64(0); ; {
+		invs, err := a.clients.LN.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{
+			IndexOffset:    offset,
+			NumMaxInvoices: 1000,
+		})
+		if err != nil || len(invs.GetInvoices()) == 0 {
+			break
+		}
 		for _, inv := range invs.GetInvoices() {
 			if inv.GetState() == lnrpc.Invoice_SETTLED {
 				entries = append(entries, paymentEntry{
-					ts: inv.SettleDate,
-					incoming: true, amtMsat: inv.AmtPaidMsat,
+					ts:        inv.SettleDate,
+					incoming:  true, amtMsat: inv.AmtPaidMsat,
 					assetName: "BTC", kind: "ln_in", lnIn: inv,
 				})
 			}
 		}
+		next := invs.GetLastIndexOffset()
+		if next <= offset {
+			break
+		}
+		offset = next
 	}
 
 	// Onchain BTC transactions.
