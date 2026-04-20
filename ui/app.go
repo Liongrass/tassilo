@@ -1056,25 +1056,12 @@ func (a *App) showPayments() {
 			prefix = "-"
 		}
 
-		var typeLabel string
-		switch e.kind {
-		case "ln_out":
-			if e.assetName != "BTC" {
-				typeLabel = "Lightning out (asset)"
-			} else {
-				typeLabel = "Lightning out"
-			}
-		case "ln_in":
-			if e.assetName != "BTC" {
-				typeLabel = "Lightning in (asset)"
-			} else {
-				typeLabel = "Lightning in"
-			}
-		case "onchain":
-			typeLabel = "Onchain"
-		case "asset":
-			typeLabel = "Asset"
-		}
+		typeLabel := map[string]string{
+			"ln_out":  "Lightning",
+			"ln_in":   "Lightning",
+			"onchain": "Onchain",
+			"asset":   "Onchain",
+		}[e.kind]
 
 		table.SetCell(row, 0, tview.NewTableCell(ts))
 		table.SetCell(row, 1, tview.NewTableCell(color+prefix+amtStr+"[-]"))
