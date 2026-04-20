@@ -169,6 +169,7 @@ func (a *App) showDashboard() {
 		AddItem("Receive — create invoice", "Create a taproot asset or BTC invoice", 'r', func() { a.showReceive() }).
 		AddItem("Send — pay invoice", "Pay a bolt11 or asset invoice", 's', func() { a.showSend() }).
 		AddItem("List payments", "Show all incoming and outgoing payments", 'p', func() { a.showPayments() }).
+		AddItem("List channels", "Show all BTC and asset channels", 'c', func() { a.showChannels() }).
 		AddItem("Open channel", "Open a BTC or asset-denominated channel", 'o', func() { a.showOpenChannel() }).
 		AddItem("List assets", "Show all known taproot assets", 'a', func() { a.showAssets() }).
 		AddItem("Refresh", "Reload balances from node", 'f', func() {
@@ -934,6 +935,181 @@ type paymentEntry struct {
 	lnIn      *lnrpc.Invoice
 	onchain   *lnrpc.Transaction
 	assetXfer *taprpc.AssetTransfer
+}
+
+func (a *App) showChannels() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	chResp, err := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
+	if err != nil {
+		a.showDashboard()
+		return
+	}
+
+	// Asset metadata for name + decimal display lookups.
+	var allAssets []*taprpc.Asset
+	if al, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+		},
+	}); err == nil {
+		allAssets = al.GetAssets()
+	}
+	metaByKey := buildGroupMetaMap(allAssets)
+
+	type channelRow struct {
+		ch        *lnrpc.Channel
+		assetName string
+		decDisp   uint32
+		capacity  uint64
+		local     uint64
+		remote    uint64
+		isBTC     bool
+	}
+
+	var rows []channelRow
+	for _, ch := range chResp.GetChannels() {
+		row := channelRow{ch: ch}
+
+		if len(ch.CustomChannelData) > 0 {
+			var data jsonAssetChannel
+			if jsonErr := json.Unmarshal(ch.CustomChannelData, &data); jsonErr == nil && data.GroupKey != "" {
+				if meta, ok := metaByKey[data.GroupKey]; ok {
+					row.assetName = meta.name
+					row.decDisp = meta.decimalDisplay
+				} else {
+					row.assetName = data.GroupKey[:min(12, len(data.GroupKey))]
+				}
+				row.local = data.LocalBalance
+				row.remote = data.RemoteBalance
+				row.capacity = data.LocalBalance + data.RemoteBalance
+			}
+		}
+
+		if row.assetName == "" {
+			row.assetName = "BTC"
+			row.local = uint64(ch.LocalBalance)
+			row.remote = uint64(ch.RemoteBalance)
+			row.capacity = uint64(ch.Capacity)
+			row.isBTC = true
+		}
+
+		rows = append(rows, row)
+	}
+
+	// Sort: BTC channels first, then by asset name.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].isBTC != rows[j].isBTC {
+			return rows[i].isBTC
+		}
+		return rows[i].assetName < rows[j].assetName
+	})
+
+	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
+
+	hdr := func(s string) *tview.TableCell {
+		return tview.NewTableCell("[yellow]" + s + "[-]").SetSelectable(false).SetExpansion(1)
+	}
+	table.SetCell(0, 0, hdr("Peer"))
+	table.SetCell(0, 1, hdr("Asset"))
+	table.SetCell(0, 2, hdr("Capacity"))
+	table.SetCell(0, 3, hdr("Local"))
+	table.SetCell(0, 4, hdr("Remote"))
+
+	for i, row := range rows {
+		r := i + 1
+
+		peer := row.ch.RemotePubkey
+		if len(peer) > 24 {
+			peer = peer[:12] + "…" + peer[len(peer)-8:]
+		}
+		peerColor := "[white]"
+		if !row.ch.Active {
+			peerColor = "[grey]"
+		}
+
+		capacityStr := formatAssetAmount(row.capacity, row.decDisp)
+		localStr := formatAssetAmount(row.local, row.decDisp)
+		remoteStr := formatAssetAmount(row.remote, row.decDisp)
+		if row.isBTC {
+			capacityStr += " sat"
+			localStr += " sat"
+			remoteStr += " sat"
+		}
+
+		table.SetCell(r, 0, tview.NewTableCell(peerColor+peer+"[-]"))
+		table.SetCell(r, 1, tview.NewTableCell(row.assetName))
+		table.SetCell(r, 2, tview.NewTableCell(capacityStr))
+		table.SetCell(r, 3, tview.NewTableCell("[green]"+localStr+"[-]"))
+		table.SetCell(r, 4, tview.NewTableCell("[blue]"+remoteStr+"[-]"))
+	}
+
+	table.SetSelectedFunc(func(row, _ int) {
+		if row < 1 || row > len(rows) {
+			return
+		}
+		a.showChannelDetail(rows[row-1].ch, rows[row-1].assetName, rows[row-1].decDisp,
+			rows[row-1].capacity, rows[row-1].local, rows[row-1].remote)
+	})
+
+	table.SetBorder(true).SetTitle(fmt.Sprintf(" Channels (%d) ", len(rows)))
+	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("channels", table, true)
+}
+
+func (a *App) showChannelDetail(ch *lnrpc.Channel, assetName string, decDisp uint32, capacity, local, remote uint64) {
+	var sb strings.Builder
+
+	active := "[green]active[-]"
+	if !ch.Active {
+		active = "[grey]inactive[-]"
+	}
+	visibility := "public"
+	if ch.Private {
+		visibility = "private"
+	}
+
+	sb.WriteString(fmt.Sprintf("[yellow]Channel  %s  %s[-]\n\n", active, visibility))
+	sb.WriteString(fmt.Sprintf("Peer:      %s\n", ch.RemotePubkey))
+	sb.WriteString(fmt.Sprintf("ChanPoint: %s\n", ch.ChannelPoint))
+	sb.WriteString(fmt.Sprintf("ChanID:    %d\n\n", ch.ChanId))
+
+	if assetName == "BTC" {
+		sb.WriteString(fmt.Sprintf("Capacity:  %s sat\n", formatCommas(capacity)))
+		sb.WriteString(fmt.Sprintf("Local:     [green]%s sat[-]\n", formatCommas(local)))
+		sb.WriteString(fmt.Sprintf("Remote:    [blue]%s sat[-]\n", formatCommas(remote)))
+	} else {
+		sb.WriteString(fmt.Sprintf("Asset:     %s\n", assetName))
+		sb.WriteString(fmt.Sprintf("Capacity:  %s\n", formatAssetAmount(capacity, decDisp)))
+		sb.WriteString(fmt.Sprintf("Local:     [green]%s[-]\n", formatAssetAmount(local, decDisp)))
+		sb.WriteString(fmt.Sprintf("Remote:    [blue]%s[-]\n", formatAssetAmount(remote, decDisp)))
+		sb.WriteString(fmt.Sprintf("\nBTC capacity: %s sat\n", formatCommas(uint64(ch.Capacity))))
+	}
+
+	if ch.CommitFee > 0 {
+		sb.WriteString(fmt.Sprintf("\nCommit fee: %s sat\n", formatCommas(uint64(ch.CommitFee))))
+	}
+	if ch.NumUpdates > 0 {
+		sb.WriteString(fmt.Sprintf("Updates:    %d\n", ch.NumUpdates))
+	}
+
+	detail := tview.NewTextView().SetText(sb.String()).SetDynamicColors(true)
+	detail.SetBorder(true).SetTitle(" Channel Detail ")
+	detail.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showChannels()
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("channel_detail", detail, true)
 }
 
 func (a *App) showPayments() {
