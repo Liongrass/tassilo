@@ -877,133 +877,182 @@ type paymentEntry struct {
 }
 
 func (a *App) showPayments() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	const pageSize = uint64(100)
 
-	var entries []paymentEntry
-
-	// Outgoing LN payments (succeeded only) — paginate to get all.
-	for offset := uint64(0); ; {
-		pmts, err := a.clients.LN.ListPayments(ctx, &lnrpc.ListPaymentsRequest{
-			IndexOffset: offset,
-			MaxPayments: 1000,
-		})
-		if err != nil || len(pmts.GetPayments()) == 0 {
-			break
-		}
-		for _, p := range pmts.GetPayments() {
-			if p.Status == lnrpc.Payment_SUCCEEDED {
-				entries = append(entries, paymentEntry{
-					ts:        p.CreationTimeNs / 1_000_000_000,
-					incoming:  false, amtMsat: p.ValueMsat,
-					assetName: "BTC", kind: "ln_out", lnOut: p,
-				})
-			}
-		}
-		next := pmts.GetLastIndexOffset()
-		if next <= offset {
-			break
-		}
-		offset = next
+	newCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 15*time.Second)
 	}
 
-	// Incoming LN invoices (settled only) — paginate to get all.
-	for offset := uint64(0); ; {
-		invs, err := a.clients.LN.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{
-			IndexOffset:    offset,
-			NumMaxInvoices: 1000,
-		})
-		if err != nil || len(invs.GetInvoices()) == 0 {
-			break
-		}
-		for _, inv := range invs.GetInvoices() {
-			if inv.GetState() == lnrpc.Invoice_SETTLED {
-				entries = append(entries, paymentEntry{
-					ts:        inv.SettleDate,
-					incoming:  true, amtMsat: inv.AmtPaidMsat,
-					assetName: "BTC", kind: "ln_in", lnIn: inv,
-				})
-			}
-		}
-		next := invs.GetLastIndexOffset()
-		if next <= offset {
-			break
-		}
-		offset = next
-	}
-
-	// Onchain BTC transactions.
-	if txns, err := a.clients.LN.GetTransactions(ctx, &lnrpc.GetTransactionsRequest{}); err == nil {
-		for _, tx := range txns.GetTransactions() {
-			amt := tx.Amount
-			entries = append(entries, paymentEntry{
-				ts: tx.TimeStamp,
-				incoming: amt > 0, amtMsat: amt * 1000,
-				assetName: "BTC", kind: "onchain", onchain: tx,
-			})
-		}
-	}
-
-	// Build asset metadata maps for both group-key and asset-ID lookups.
+	// Asset metadata — fetched once, reused for backfill.
 	var allAssets []*taprpc.Asset
 	assetIDToMeta := make(map[string]struct {
 		name string
 		dd   uint32
 	})
-	if al, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
-		ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
-			Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
-		},
-	}); err == nil {
+	func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		al, err := a.clients.Tap.ListAssets(ctx, &taprpc.ListAssetRequest{
+			ScriptKeyType: &taprpc.ScriptKeyTypeQuery{
+				Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
+			},
+		})
+		if err != nil {
+			return
+		}
 		allAssets = al.GetAssets()
 		for _, asset := range allAssets {
 			key := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
-			if _, exists := assetIDToMeta[key]; !exists {
-				dd := uint32(0)
-				if asset.DecimalDisplay != nil {
-					dd = asset.DecimalDisplay.DecimalDisplay
-				}
-				assetIDToMeta[key] = struct {
-					name string
-					dd   uint32
-				}{asset.AssetGenesis.Name, dd}
+			if _, exists := assetIDToMeta[key]; exists {
+				continue
 			}
+			dd := uint32(0)
+			if asset.DecimalDisplay != nil {
+				dd = asset.DecimalDisplay.DecimalDisplay
+			}
+			assetIDToMeta[key] = struct {
+				name string
+				dd   uint32
+			}{asset.AssetGenesis.Name, dd}
 		}
-	}
+	}()
 	metaByKey := buildGroupMetaMap(allAssets)
 
-	// Back-fill asset info for LN payments with CustomChannelData.
-	for i := range entries {
-		e := &entries[i]
-		if e.kind == "ln_out" && e.lnOut != nil {
-			for _, htlc := range e.lnOut.Htlcs {
-				if htlc.Status != lnrpc.HTLCAttempt_SUCCEEDED {
-					continue
-				}
-				if htlc.Route == nil {
-					continue
-				}
-				if name, amt, dd, found := parsePaymentAsset(htlc.Route.CustomChannelData, metaByKey); found {
-					e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
-					break
+	var entries []paymentEntry
+	// Cursors: LastIndexOffset from previous page; 0 means exhausted.
+	var lnOutCursor uint64
+	var lnInCursor uint64
+
+	loadLNOut := func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		resp, err := a.clients.LN.ListPayments(ctx, &lnrpc.ListPaymentsRequest{
+			IncludeIncomplete: true,
+			Reversed:          true,
+			IndexOffset:       lnOutCursor,
+			MaxPayments:       pageSize,
+		})
+		if err != nil {
+			return
+		}
+		batch := resp.GetPayments()
+		for _, p := range batch {
+			entries = append(entries, paymentEntry{
+				ts:        p.CreationTimeNs / 1_000_000_000,
+				incoming:  false,
+				amtMsat:   p.ValueMsat,
+				assetName: "BTC",
+				kind:      "ln_out",
+				lnOut:     p,
+			})
+		}
+		last := resp.GetLastIndexOffset()
+		if uint64(len(batch)) < pageSize || last == 0 {
+			lnOutCursor = 0
+		} else {
+			lnOutCursor = last
+		}
+	}
+
+	loadLNIn := func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		resp, err := a.clients.LN.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{
+			Reversed:       true,
+			IndexOffset:    lnInCursor,
+			NumMaxInvoices: pageSize,
+		})
+		if err != nil {
+			return
+		}
+		batch := resp.GetInvoices()
+		for _, inv := range batch {
+			if inv.GetState() != lnrpc.Invoice_SETTLED {
+				continue
+			}
+			entries = append(entries, paymentEntry{
+				ts:        inv.SettleDate,
+				incoming:  true,
+				amtMsat:   inv.AmtPaidMsat,
+				assetName: "BTC",
+				kind:      "ln_in",
+				lnIn:      inv,
+			})
+		}
+		last := resp.GetLastIndexOffset()
+		if uint64(len(batch)) < pageSize || last == 0 {
+			lnInCursor = 0
+		} else {
+			lnInCursor = last
+		}
+	}
+
+	// backfillFrom checks new entries for asset LN payments via CustomChannelData.
+	backfillFrom := func(start int) {
+		for i := start; i < len(entries); i++ {
+			e := &entries[i]
+			if e.assetName != "BTC" {
+				continue
+			}
+			if e.kind == "ln_out" && e.lnOut != nil {
+				for _, htlc := range e.lnOut.Htlcs {
+					if htlc.Status != lnrpc.HTLCAttempt_SUCCEEDED || htlc.Route == nil {
+						continue
+					}
+					if name, amt, dd, found := parsePaymentAsset(htlc.Route.CustomChannelData, metaByKey); found {
+						e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+						break
+					}
 				}
 			}
-		}
-		if e.kind == "ln_in" && e.lnIn != nil {
-			for _, htlc := range e.lnIn.Htlcs {
-				if htlc.State != lnrpc.InvoiceHTLCState_SETTLED {
-					continue
-				}
-				if name, amt, dd, found := parsePaymentAsset(htlc.CustomChannelData, metaByKey); found {
-					e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
-					break
+			if e.kind == "ln_in" && e.lnIn != nil {
+				for _, htlc := range e.lnIn.Htlcs {
+					if htlc.State != lnrpc.InvoiceHTLCState_SETTLED {
+						continue
+					}
+					if name, amt, dd, found := parsePaymentAsset(htlc.CustomChannelData, metaByKey); found {
+						e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
+						break
+					}
 				}
 			}
 		}
 	}
-	if xfers, err := a.clients.Tap.ListTransfers(ctx, &taprpc.ListTransfersRequest{}); err == nil {
+
+	// Initial LN page (newest first).
+	loadLNOut()
+	loadLNIn()
+
+	// Onchain BTC — fetch all (typically small).
+	func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		txns, err := a.clients.LN.GetTransactions(ctx, &lnrpc.GetTransactionsRequest{})
+		if err != nil {
+			return
+		}
+		for _, tx := range txns.GetTransactions() {
+			amt := tx.Amount
+			entries = append(entries, paymentEntry{
+				ts:        tx.TimeStamp,
+				incoming:  amt > 0,
+				amtMsat:   amt * 1000,
+				assetName: "BTC",
+				kind:      "onchain",
+				onchain:   tx,
+			})
+		}
+	}()
+
+	// Asset transfers — fetch all (typically small).
+	func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		xfers, err := a.clients.Tap.ListTransfers(ctx, &taprpc.ListTransfersRequest{})
+		if err != nil {
+			return
+		}
 		for _, xfer := range xfers.GetTransfers() {
-			// Outgoing: any OUTPUT_TYPE_SIMPLE output where we don't own the key.
 			outgoing := false
 			for _, out := range xfer.Outputs {
 				if !out.ScriptKeyIsLocal && out.OutputType == taprpc.OutputType_OUTPUT_TYPE_SIMPLE {
@@ -1041,57 +1090,61 @@ func (a *App) showPayments() {
 				assetName = "(unknown)"
 			}
 			entries = append(entries, paymentEntry{
-				ts: xfer.TransferTimestamp,
-				incoming: !outgoing, amtAsset: totalAmt,
-				assetName: assetName, decDisp: dd,
-				kind: "asset", assetXfer: xfer,
+				ts:        xfer.TransferTimestamp,
+				incoming:  !outgoing,
+				amtAsset:  totalAmt,
+				assetName: assetName,
+				decDisp:   dd,
+				kind:      "asset",
+				assetXfer: xfer,
 			})
 		}
-	}
+	}()
 
+	backfillFrom(0)
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
 
-	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 	headers := []string{"Date", "Amount", "Asset", "Type"}
-	for col, h := range headers {
-		table.SetCell(0, col, tview.NewTableCell("[yellow]"+h+"[-]").
-			SetSelectable(false).SetExpansion(1))
-	}
+	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 
-	for i, e := range entries {
-		row := i + 1
-		ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
-
-		var amtStr string
-		if e.assetName != "BTC" {
-			amtStr = formatAssetAmount(e.amtAsset, e.decDisp)
-		} else {
-			sat := e.amtMsat / 1000
-			if sat < 0 {
-				sat = -sat
+	rebuildTable := func() {
+		table.Clear()
+		for col, h := range headers {
+			table.SetCell(0, col, tview.NewTableCell("[yellow]"+h+"[-]").
+				SetSelectable(false).SetExpansion(1))
+		}
+		for i, e := range entries {
+			row := i + 1
+			ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
+			var amtStr string
+			if e.assetName != "BTC" {
+				amtStr = formatAssetAmount(e.amtAsset, e.decDisp)
+			} else {
+				sat := e.amtMsat / 1000
+				if sat < 0 {
+					sat = -sat
+				}
+				amtStr = formatCommas(uint64(sat)) + " sat"
 			}
-			amtStr = formatCommas(uint64(sat)) + " sat"
+			color := "[green]"
+			prefix := "+"
+			if !e.incoming {
+				color = "[red]"
+				prefix = "-"
+			}
+			typeLabel := map[string]string{
+				"ln_out": "Lightning", "ln_in": "Lightning",
+				"onchain": "Onchain", "asset": "Onchain",
+			}[e.kind]
+			table.SetCell(row, 0, tview.NewTableCell(ts))
+			table.SetCell(row, 1, tview.NewTableCell(color+prefix+amtStr+"[-]"))
+			table.SetCell(row, 2, tview.NewTableCell(e.assetName))
+			table.SetCell(row, 3, tview.NewTableCell(typeLabel))
 		}
-
-		color := "[green]"
-		prefix := "+"
-		if !e.incoming {
-			color = "[red]"
-			prefix = "-"
-		}
-
-		typeLabel := map[string]string{
-			"ln_out":  "Lightning",
-			"ln_in":   "Lightning",
-			"onchain": "Onchain",
-			"asset":   "Onchain",
-		}[e.kind]
-
-		table.SetCell(row, 0, tview.NewTableCell(ts))
-		table.SetCell(row, 1, tview.NewTableCell(color+prefix+amtStr+"[-]"))
-		table.SetCell(row, 2, tview.NewTableCell(e.assetName))
-		table.SetCell(row, 3, tview.NewTableCell(typeLabel))
+		table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 	}
+
+	rebuildTable()
 
 	table.SetSelectedFunc(func(row, _ int) {
 		if row < 1 || row > len(entries) {
@@ -1100,14 +1153,28 @@ func (a *App) showPayments() {
 		a.showPaymentDetail(entries[row-1])
 	})
 
-	table.SetBorder(true).SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
+	table.SetBorder(true)
 	table.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
 			return nil
 		}
+		// Load older payments when the user reaches the last row.
+		if event.Key() == tcell.KeyDown || event.Rune() == 'j' {
+			row, _ := table.GetSelection()
+			if row >= table.GetRowCount()-1 && (lnOutCursor > 0 || lnInCursor > 0) {
+				prevLen := len(entries)
+				loadLNOut()
+				loadLNIn()
+				backfillFrom(prevLen)
+				sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
+				rebuildTable()
+				table.Select(row, 0)
+			}
+		}
 		return event
 	})
+
 	a.pages.AddAndSwitchToPage("payments", table, true)
 }
 
