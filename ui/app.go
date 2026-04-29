@@ -1397,6 +1397,47 @@ func (a *App) showPayments() {
 	}
 	table := tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
 
+	setEntryRow := func(row int, e paymentEntry) {
+		ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
+		var rawAmt string
+		switch {
+		case e.assetName == "BTC":
+			sat := e.amtMsat / 1000
+			if sat < 0 {
+				sat = -sat
+			}
+			rawAmt = formatCommas(uint64(sat))
+		case e.amtAsset > 0:
+			rawAmt = formatAssetAmount(e.amtAsset, e.decDisp)
+		default:
+			rawAmt = "?" // TAP payment detected but amount unresolved
+		}
+		color := "[green]"
+		prefix := "+"
+		if !e.incoming {
+			color = "[red]"
+			prefix = "-"
+		}
+		// Pad/truncate visible amount (prefix + digits) to fixed width.
+		visibleAmt := fmt.Sprintf("%-*s", wAmt, prefix+rawAmt)
+		typeEmoji := map[string]string{
+			"ln_out": "⚡", "ln_in": "⚡",
+			"onchain": "⛓️", "asset": "⛓️",
+		}[e.kind]
+		var memo string
+		switch e.kind {
+		case "ln_in":
+			memo = e.lnIn.Memo
+		case "onchain":
+			memo = e.onchain.Label
+		}
+		table.SetCell(row, 0, tview.NewTableCell(ts).SetMaxWidth(wDate))
+		table.SetCell(row, 1, tview.NewTableCell(color+visibleAmt+"[-]").SetMaxWidth(wAmt))
+		table.SetCell(row, 2, tview.NewTableCell(fmt.Sprintf("%-*s", wAsset, clip(e.assetName, wAsset))).SetMaxWidth(wAsset))
+		table.SetCell(row, 3, tview.NewTableCell(typeEmoji).SetMaxWidth(wType))
+		table.SetCell(row, 4, tview.NewTableCell(clip(memo, wMemo)).SetMaxWidth(wMemo))
+	}
+
 	rebuildTable := func() {
 		table.Clear()
 		for col, h := range headers {
@@ -1404,45 +1445,7 @@ func (a *App) showPayments() {
 				SetSelectable(false))
 		}
 		for i, e := range entries {
-			row := i + 1
-			ts := time.Unix(e.ts, 0).Format("2006-01-02 15:04")
-			var rawAmt string
-			switch {
-			case e.assetName == "BTC":
-				sat := e.amtMsat / 1000
-				if sat < 0 {
-					sat = -sat
-				}
-				rawAmt = formatCommas(uint64(sat))
-			case e.amtAsset > 0:
-				rawAmt = formatAssetAmount(e.amtAsset, e.decDisp)
-			default:
-				rawAmt = "?" // TAP payment detected but amount unresolved
-			}
-			color := "[green]"
-			prefix := "+"
-			if !e.incoming {
-				color = "[red]"
-				prefix = "-"
-			}
-			// Pad/truncate visible amount (prefix + digits) to fixed width.
-			visibleAmt := fmt.Sprintf("%-*s", wAmt, prefix+rawAmt)
-			typeEmoji := map[string]string{
-				"ln_out": "⚡", "ln_in": "⚡",
-				"onchain": "⛓️", "asset": "⛓️",
-			}[e.kind]
-			var memo string
-			switch e.kind {
-			case "ln_in":
-				memo = e.lnIn.Memo
-			case "onchain":
-				memo = e.onchain.Label
-			}
-			table.SetCell(row, 0, tview.NewTableCell(ts).SetMaxWidth(wDate))
-			table.SetCell(row, 1, tview.NewTableCell(color+visibleAmt+"[-]").SetMaxWidth(wAmt))
-			table.SetCell(row, 2, tview.NewTableCell(fmt.Sprintf("%-*s", wAsset, clip(e.assetName, wAsset))).SetMaxWidth(wAsset))
-			table.SetCell(row, 3, tview.NewTableCell(typeEmoji).SetMaxWidth(wType))
-			table.SetCell(row, 4, tview.NewTableCell(clip(memo, wMemo)).SetMaxWidth(wMemo))
+			setEntryRow(i+1, e)
 		}
 		table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 	}
@@ -1479,8 +1482,11 @@ func (a *App) showPayments() {
 					}
 					backfillFrom(prevLen)
 					sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
-					rebuildTable()
-					table.Select(row, 0)
+					// Append only new rows — clearing the table resets the viewport.
+					for i := prevLen; i < len(entries); i++ {
+						setEntryRow(i+1, entries[i])
+					}
+					table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 				}
 				return nil
 			}
