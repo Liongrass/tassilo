@@ -2,18 +2,14 @@
 
 A terminal UI wallet for [Taproot Assets](https://github.com/lightninglabs/taproot-assets) built on top of [Lightning Terminal (litd)](https://github.com/lightninglabs/lightning-terminal).
 
+![Tassilo TUI](media/screenshot_01.png)
+
 ## Requirements
 
 - A running `litd` instance (which bundles `lnd` + `tapd`)
 - Go 1.21+
 
 ## Installation
-
-```sh
-go install github.com/lightninglabs/tassilo@latest
-```
-
-Or build from source:
 
 ```sh
 git clone https://github.com/lightninglabs/tassilo
