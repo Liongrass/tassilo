@@ -1192,10 +1192,8 @@ func (a *App) showPayments() {
 	metaByKey := buildGroupMetaMap(allAssets)
 
 	var entries []paymentEntry
-	// Cursors: LastIndexOffset from previous page; 0 means exhausted.
-	var lnOutCursor uint64
-	var lnInCursor uint64
-	// Seen-hash sets prevent duplicates in case pages overlap.
+	var lnOutOffset, lnInOffset uint64
+	var lnOutDone, lnInDone bool
 	seenLNOut := make(map[string]struct{})
 	seenLNIn := make(map[string]struct{})
 
@@ -1205,13 +1203,14 @@ func (a *App) showPayments() {
 		resp, err := a.clients.LN.ListPayments(ctx, &lnrpc.ListPaymentsRequest{
 			IncludeIncomplete: true,
 			Reversed:          true,
-			IndexOffset:       lnOutCursor,
+			IndexOffset:       lnOutOffset,
 			MaxPayments:       pageSize,
 		})
-		if err != nil {
+		batch := resp.GetPayments()
+		if err != nil || len(batch) == 0 {
+			lnOutDone = true
 			return
 		}
-		batch := resp.GetPayments()
 		for _, p := range batch {
 			if _, seen := seenLNOut[p.PaymentHash]; seen {
 				continue
@@ -1226,11 +1225,9 @@ func (a *App) showPayments() {
 				lnOut:     p,
 			})
 		}
-		last := resp.GetLastIndexOffset()
-		if uint64(len(batch)) < pageSize || last == 0 {
-			lnOutCursor = 0
-		} else {
-			lnOutCursor = last
+		lnOutOffset = resp.GetLastIndexOffset()
+		if uint64(len(batch)) < pageSize {
+			lnOutDone = true
 		}
 	}
 
@@ -1239,13 +1236,14 @@ func (a *App) showPayments() {
 		defer cancel()
 		resp, err := a.clients.LN.ListInvoices(ctx, &lnrpc.ListInvoiceRequest{
 			Reversed:       true,
-			IndexOffset:    lnInCursor,
+			IndexOffset:    lnInOffset,
 			NumMaxInvoices: pageSize,
 		})
-		if err != nil {
+		batch := resp.GetInvoices()
+		if err != nil || len(batch) == 0 {
+			lnInDone = true
 			return
 		}
-		batch := resp.GetInvoices()
 		for _, inv := range batch {
 			if inv.GetState() != lnrpc.Invoice_SETTLED {
 				continue
@@ -1265,11 +1263,9 @@ func (a *App) showPayments() {
 				lnIn:      inv,
 			})
 		}
-		last := resp.GetLastIndexOffset()
-		if uint64(len(batch)) < pageSize || last == 0 {
-			lnInCursor = 0
-		} else {
-			lnInCursor = last
+		lnInOffset = resp.GetLastIndexOffset()
+		if uint64(len(batch)) < pageSize {
+			lnInDone = true
 		}
 	}
 
@@ -1512,19 +1508,13 @@ func (a *App) showPayments() {
 		if event.Key() == tcell.KeyDown || event.Rune() == 'j' {
 			row, _ := table.GetSelection()
 			if row >= table.GetRowCount()-1 {
-				if lnOutCursor > 0 || lnInCursor > 0 {
+				if !lnOutDone || !lnInDone {
 					prevLen := len(entries)
-					// Keep fetching pages until at least one new visible entry
-					// appears or all sources are exhausted. This skips through
-					// pages of unsettled invoices (which add 0 entries) without
-					// requiring repeated Down presses from the user.
-					for len(entries) == prevLen && (lnOutCursor > 0 || lnInCursor > 0) {
-						if lnOutCursor > 0 {
-							loadLNOut()
-						}
-						if lnInCursor > 0 {
-							loadLNIn()
-						}
+					if !lnOutDone {
+						loadLNOut()
+					}
+					if !lnInDone {
+						loadLNIn()
 					}
 					if len(entries) > prevLen {
 						backfillFrom(prevLen)
