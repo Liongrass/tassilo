@@ -1501,8 +1501,12 @@ func (a *App) showPayments() {
 						loadLNIn()
 					}
 					backfillFrom(prevLen)
-					sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
-					// Append only new rows — clearing the table resets the viewport.
+					// Sort only the newly fetched entries among themselves.
+					// Re-sorting all entries would displace existing ones past prevLen
+					// and cause them to appear twice in the table.
+					newPart := entries[prevLen:]
+					sort.Slice(newPart, func(i, j int) bool { return newPart[i].ts > newPart[j].ts })
+					// Append new rows without touching existing ones.
 					for i := prevLen; i < len(entries); i++ {
 						setEntryRow(i+1, entries[i])
 					}
