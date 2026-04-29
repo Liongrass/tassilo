@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -931,6 +932,7 @@ type paymentEntry struct {
 	assetName string // "BTC" or the asset genesis name
 	decDisp   uint32
 	kind      string // "ln_out" | "ln_in" | "onchain" | "asset"
+	memo      string
 	lnOut     *lnrpc.Payment
 	lnIn      *lnrpc.Invoice
 	onchain   *lnrpc.Transaction
@@ -1224,6 +1226,7 @@ func (a *App) showPayments() {
 				amtMsat:   inv.AmtPaidMsat,
 				assetName: "BTC",
 				kind:      "ln_in",
+				memo:      inv.Memo,
 				lnIn:      inv,
 			})
 		}
@@ -1285,6 +1288,29 @@ func (a *App) showPayments() {
 				e.amtMsat = 0
 			}
 		}
+
+		// Decode payment requests for BTC outgoing payments to populate memos.
+		type memoJob struct{ idx int; payReq string }
+		var jobs []memoJob
+		for i := start; i < len(entries); i++ {
+			e := &entries[i]
+			if e.kind == "ln_out" && e.assetName == "BTC" && e.lnOut != nil && e.lnOut.PaymentRequest != "" {
+				jobs = append(jobs, memoJob{i, e.lnOut.PaymentRequest})
+			}
+		}
+		var wg sync.WaitGroup
+		for _, job := range jobs {
+			wg.Add(1)
+			go func(idx int, pr string) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if decoded, err := a.clients.LN.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: pr}); err == nil {
+					entries[idx].memo = decoded.Description
+				}
+			}(job.idx, job.payReq)
+		}
+		wg.Wait()
 	}
 
 	// Initial LN page (newest first).
@@ -1307,6 +1333,7 @@ func (a *App) showPayments() {
 				amtMsat:   amt * 1000,
 				assetName: "BTC",
 				kind:      "onchain",
+				memo:      tx.Label,
 				onchain:   tx,
 			})
 		}
@@ -1424,18 +1451,11 @@ func (a *App) showPayments() {
 			"ln_out": "⚡", "ln_in": "⚡",
 			"onchain": "⛓️", "asset": "⛓️",
 		}[e.kind]
-		var memo string
-		switch e.kind {
-		case "ln_in":
-			memo = e.lnIn.Memo
-		case "onchain":
-			memo = e.onchain.Label
-		}
 		table.SetCell(row, 0, tview.NewTableCell(ts).SetMaxWidth(wDate))
 		table.SetCell(row, 1, tview.NewTableCell(color+visibleAmt+"[-]").SetMaxWidth(wAmt))
 		table.SetCell(row, 2, tview.NewTableCell(fmt.Sprintf("%-*s", wAsset, clip(e.assetName, wAsset))).SetMaxWidth(wAsset))
 		table.SetCell(row, 3, tview.NewTableCell(typeEmoji).SetMaxWidth(wType))
-		table.SetCell(row, 4, tview.NewTableCell(clip(memo, wMemo)).SetMaxWidth(wMemo))
+		table.SetCell(row, 4, tview.NewTableCell(clip(e.memo, wMemo)).SetMaxWidth(wMemo))
 	}
 
 	rebuildTable := func() {
