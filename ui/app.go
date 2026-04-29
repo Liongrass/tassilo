@@ -512,7 +512,7 @@ func (a *App) showReceive() {
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.showAssetPicker("receive", func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
+			a.showAssetPicker("receive", taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL, func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
 				if name == "" {
 					// cancelled — leave current selection unchanged
 					a.tapp.SetFocus(form)
@@ -548,7 +548,7 @@ func (a *App) showReceive() {
 	a.pages.AddAndSwitchToPage("receive", form, true)
 }
 
-func (a *App) showAssetPicker(returnPage string, done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
+func (a *App) showAssetPicker(returnPage string, keyType taprpc.ScriptKeyType, done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -568,7 +568,7 @@ func (a *App) showAssetPicker(returnPage string, done func(name, assetIDHex, gro
 	var options []assetOption
 	seen := make(map[string]bool)
 	for _, asset := range resp.GetAssets() {
-		if asset.ScriptKeyType != taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL {
+		if asset.ScriptKeyType != keyType {
 			continue
 		}
 		assetIDHex := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
@@ -1676,7 +1676,7 @@ func (a *App) showOpenChannel() {
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.showAssetPicker("openchan", func(name, assetIDHex, groupKeyHex string, _ uint32) {
+			a.showAssetPicker("openchan", taprpc.ScriptKeyType_SCRIPT_KEY_BIP86, func(name, assetIDHex, groupKeyHex string, _ uint32) {
 				if name == "" {
 					a.tapp.SetFocus(form)
 					return
