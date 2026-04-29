@@ -1469,8 +1469,14 @@ func (a *App) showPayments() {
 			if row >= table.GetRowCount()-1 {
 				if lnOutCursor > 0 || lnInCursor > 0 {
 					prevLen := len(entries)
-					loadLNOut()
-					loadLNIn()
+					// Guard each call with its own cursor so a zero cursor
+					// doesn't re-fetch the initial page and add duplicates.
+					if lnOutCursor > 0 {
+						loadLNOut()
+					}
+					if lnInCursor > 0 {
+						loadLNIn()
+					}
 					backfillFrom(prevLen)
 					sort.Slice(entries, func(i, j int) bool { return entries[i].ts > entries[j].ts })
 					rebuildTable()
