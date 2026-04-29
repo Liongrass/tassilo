@@ -439,6 +439,7 @@ func bolt11Desc(payReq string) string {
 		&chaincfg.TestNet3Params,
 		&chaincfg.RegressionNetParams,
 		&chaincfg.SimNetParams,
+		&chaincfg.SigNetParams,
 	}
 	for _, net := range nets {
 		inv, err := zpay32.Decode(payReq, net)
@@ -1323,10 +1324,12 @@ func (a *App) showPayments() {
 			}
 		}
 
-		// Populate memos for BTC outgoing payments by parsing the bolt11 locally.
+		// Populate memos for all outgoing LN payments by parsing the bolt11 locally.
+		// Asset payments have already been reclassified away from "BTC" by this
+		// point, so we must not filter on assetName here.
 		for i := start; i < len(entries); i++ {
 			e := &entries[i]
-			if e.kind == "ln_out" && e.assetName == "BTC" && e.lnOut != nil && e.lnOut.PaymentRequest != "" {
+			if e.kind == "ln_out" && e.lnOut != nil && e.lnOut.PaymentRequest != "" {
 				e.memo = bolt11Desc(e.lnOut.PaymentRequest)
 			}
 		}
