@@ -195,9 +195,20 @@ func (a *App) showDashboard() {
 
 // jsonAssetChannel matches the JSON tapd encodes into lnrpc.Channel.CustomChannelData.
 type jsonAssetChannel struct {
-	LocalBalance  uint64 `json:"local_balance"`
-	RemoteBalance uint64 `json:"remote_balance"`
-	GroupKey      string `json:"group_key,omitempty"`
+	LocalBalance  uint64           `json:"local_balance"`
+	RemoteBalance uint64           `json:"remote_balance"`
+	GroupKey      string           `json:"group_key,omitempty"`
+	FundingAssets []jsonAssetUtxo  `json:"funding_assets,omitempty"`
+}
+
+type jsonAssetUtxo struct {
+	AssetGenesis   jsonAssetGenesis `json:"asset_genesis"`
+	DecimalDisplay uint8            `json:"decimal_display"`
+}
+
+type jsonAssetGenesis struct {
+	Name    string `json:"name"`
+	AssetID string `json:"asset_id"`
 }
 
 type assetGroupBalance struct {
@@ -512,7 +523,7 @@ func (a *App) showReceive() {
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.showAssetPicker("receive", taprpc.ScriptKeyType_SCRIPT_KEY_CHANNEL, func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
+			a.showChannelAssetPicker("receive", func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
 				if name == "" {
 					// cancelled — leave current selection unchanged
 					a.tapp.SetFocus(form)
@@ -620,6 +631,97 @@ func (a *App) showAssetPicker(returnPage string, keyType taprpc.ScriptKeyType, d
 		if event.Key() == tcell.KeyEscape {
 			a.pages.SwitchToPage(returnPage)
 			done("", "", "", 0) // cancel: name=="" signals no selection
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("assetpicker", list, true)
+}
+
+// showChannelAssetPicker builds an asset picker from open channels rather than
+// ListAssets, because channel-locked assets may not carry SCRIPT_KEY_CHANNEL.
+func (a *App) showChannelAssetPicker(returnPage string, done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	chResp, _ := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{})
+
+	type assetOption struct {
+		name           string
+		assetIDHex     string
+		groupKeyHex    string
+		displayID      string
+		decimalDisplay uint32
+	}
+	var options []assetOption
+	seen := make(map[string]bool)
+
+	for _, ch := range chResp.GetChannels() {
+		if len(ch.CustomChannelData) == 0 {
+			continue
+		}
+		var data jsonAssetChannel
+		if err := json.Unmarshal(ch.CustomChannelData, &data); err != nil {
+			continue
+		}
+
+		// Collect one entry per funding asset.
+		for _, fa := range data.FundingAssets {
+			assetID := fa.AssetGenesis.AssetID
+			groupKey := data.GroupKey
+			dedupeKey := groupKey
+			if dedupeKey == "" {
+				dedupeKey = assetID
+			}
+			if seen[dedupeKey] || (assetID == "" && groupKey == "") {
+				continue
+			}
+			seen[dedupeKey] = true
+
+			displayID := groupKey
+			if displayID == "" {
+				displayID = assetID
+			}
+			options = append(options, assetOption{
+				name:           fa.AssetGenesis.Name,
+				assetIDHex:     assetID,
+				groupKeyHex:    groupKey,
+				displayID:      displayID,
+				decimalDisplay: uint32(fa.DecimalDisplay),
+			})
+		}
+
+		// Fallback: channel has custom data with a group key but no FundingAssets.
+		if len(data.FundingAssets) == 0 && data.GroupKey != "" && !seen[data.GroupKey] {
+			seen[data.GroupKey] = true
+			options = append(options, assetOption{
+				name:        data.GroupKey[:min(12, len(data.GroupKey))],
+				groupKeyHex: data.GroupKey,
+				displayID:   data.GroupKey,
+			})
+		}
+	}
+	sort.Slice(options, func(i, j int) bool {
+		return options[i].name < options[j].name
+	})
+
+	list := tview.NewList()
+	list.AddItem("BTC", "Bitcoin — no asset", 0, func() {
+		a.pages.SwitchToPage(returnPage)
+		done("BTC", "", "", 0)
+	})
+	for _, opt := range options {
+		opt := opt
+		list.AddItem(opt.name, opt.displayID, 0, func() {
+			a.pages.SwitchToPage(returnPage)
+			done(opt.name, opt.assetIDHex, opt.groupKeyHex, opt.decimalDisplay)
+		})
+	}
+	list.SetBorder(true).SetTitle(" Select Asset (Esc=cancel) ")
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.pages.SwitchToPage(returnPage)
+			done("", "", "", 0)
 			return nil
 		}
 		return event
