@@ -10,10 +10,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/gdamore/tcell/v2"
 	"github.com/lightninglabs/tassilo/client"
 	"github.com/rivo/tview"
@@ -22,6 +22,7 @@ import (
 	"github.com/lightninglabs/taproot-assets/taprpc/tapchannelrpc"
 	lnrpc "github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
+	"github.com/lightningnetwork/lnd/zpay32"
 )
 
 // App is the root TUI application.
@@ -430,6 +431,27 @@ func parseScaledAmount(s string, scale uint32) (uint64, error) {
 }
 
 // formatCommas inserts thousand separators into an integer.
+// bolt11Desc extracts the description field from a bolt11 payment request
+// without making any RPC call. Tries all common networks; returns "" on failure.
+func bolt11Desc(payReq string) string {
+	nets := []*chaincfg.Params{
+		&chaincfg.MainNetParams,
+		&chaincfg.TestNet3Params,
+		&chaincfg.RegressionNetParams,
+		&chaincfg.SimNetParams,
+	}
+	for _, net := range nets {
+		inv, err := zpay32.Decode(payReq, net)
+		if err == nil {
+			if inv.Description != nil {
+				return *inv.Description
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 func formatCommas[T uint64 | int64](n T) string {
 	s := fmt.Sprintf("%d", n)
 	out := make([]byte, 0, len(s)+(len(s)-1)/3)
@@ -1301,28 +1323,13 @@ func (a *App) showPayments() {
 			}
 		}
 
-		// Decode payment requests for BTC outgoing payments to populate memos.
-		type memoJob struct{ idx int; payReq string }
-		var jobs []memoJob
+		// Populate memos for BTC outgoing payments by parsing the bolt11 locally.
 		for i := start; i < len(entries); i++ {
 			e := &entries[i]
 			if e.kind == "ln_out" && e.assetName == "BTC" && e.lnOut != nil && e.lnOut.PaymentRequest != "" {
-				jobs = append(jobs, memoJob{i, e.lnOut.PaymentRequest})
+				e.memo = bolt11Desc(e.lnOut.PaymentRequest)
 			}
 		}
-		var wg sync.WaitGroup
-		for _, job := range jobs {
-			wg.Add(1)
-			go func(idx int, pr string) {
-				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if decoded, err := a.clients.LN.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: pr}); err == nil {
-					entries[idx].memo = decoded.Description
-				}
-			}(job.idx, job.payReq)
-		}
-		wg.Wait()
 	}
 
 	// Initial LN page (newest first).
