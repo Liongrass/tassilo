@@ -1172,6 +1172,9 @@ func (a *App) showPayments() {
 	// Cursors: LastIndexOffset from previous page; 0 means exhausted.
 	var lnOutCursor uint64
 	var lnInCursor uint64
+	// Seen-hash sets prevent duplicates in case pages overlap.
+	seenLNOut := make(map[string]struct{})
+	seenLNIn := make(map[string]struct{})
 
 	loadLNOut := func() {
 		ctx, cancel := newCtx()
@@ -1187,6 +1190,10 @@ func (a *App) showPayments() {
 		}
 		batch := resp.GetPayments()
 		for _, p := range batch {
+			if _, seen := seenLNOut[p.PaymentHash]; seen {
+				continue
+			}
+			seenLNOut[p.PaymentHash] = struct{}{}
 			entries = append(entries, paymentEntry{
 				ts:        p.CreationTimeNs / 1_000_000_000,
 				incoming:  false,
@@ -1220,6 +1227,11 @@ func (a *App) showPayments() {
 			if inv.GetState() != lnrpc.Invoice_SETTLED {
 				continue
 			}
+			key := fmt.Sprintf("%x", inv.RHash)
+			if _, seen := seenLNIn[key]; seen {
+				continue
+			}
+			seenLNIn[key] = struct{}{}
 			entries = append(entries, paymentEntry{
 				ts:        inv.SettleDate,
 				incoming:  true,
@@ -1492,25 +1504,27 @@ func (a *App) showPayments() {
 			if row >= table.GetRowCount()-1 {
 				if lnOutCursor > 0 || lnInCursor > 0 {
 					prevLen := len(entries)
-					// Guard each call with its own cursor so a zero cursor
-					// doesn't re-fetch the initial page and add duplicates.
-					if lnOutCursor > 0 {
-						loadLNOut()
+					// Keep fetching pages until at least one new visible entry
+					// appears or all sources are exhausted. This skips through
+					// pages of unsettled invoices (which add 0 entries) without
+					// requiring repeated Down presses from the user.
+					for len(entries) == prevLen && (lnOutCursor > 0 || lnInCursor > 0) {
+						if lnOutCursor > 0 {
+							loadLNOut()
+						}
+						if lnInCursor > 0 {
+							loadLNIn()
+						}
 					}
-					if lnInCursor > 0 {
-						loadLNIn()
+					if len(entries) > prevLen {
+						backfillFrom(prevLen)
+						newPart := entries[prevLen:]
+						sort.Slice(newPart, func(i, j int) bool { return newPart[i].ts > newPart[j].ts })
+						for i := prevLen; i < len(entries); i++ {
+							setEntryRow(i+1, entries[i])
+						}
+						table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 					}
-					backfillFrom(prevLen)
-					// Sort only the newly fetched entries among themselves.
-					// Re-sorting all entries would displace existing ones past prevLen
-					// and cause them to appear twice in the table.
-					newPart := entries[prevLen:]
-					sort.Slice(newPart, func(i, j int) bool { return newPart[i].ts > newPart[j].ts })
-					// Append new rows without touching existing ones.
-					for i := prevLen; i < len(entries); i++ {
-						setEntryRow(i+1, entries[i])
-					}
-					table.SetTitle(fmt.Sprintf(" Payments (%d) ", len(entries)))
 				}
 				return nil
 			}
