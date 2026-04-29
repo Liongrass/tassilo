@@ -512,7 +512,7 @@ func (a *App) showReceive() {
 	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.showAssetPicker(func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
+			a.showAssetPicker("receive", func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32) {
 				if name == "" {
 					// cancelled — leave current selection unchanged
 					a.tapp.SetFocus(form)
@@ -548,7 +548,7 @@ func (a *App) showReceive() {
 	a.pages.AddAndSwitchToPage("receive", form, true)
 }
 
-func (a *App) showAssetPicker(done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
+func (a *App) showAssetPicker(returnPage string, done func(name, assetIDHex, groupKeyHex string, decimalDisplay uint32)) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -605,20 +605,20 @@ func (a *App) showAssetPicker(done func(name, assetIDHex, groupKeyHex string, de
 
 	list := tview.NewList()
 	list.AddItem("BTC", "Bitcoin — no asset", 0, func() {
-		a.pages.SwitchToPage("receive")
+		a.pages.SwitchToPage(returnPage)
 		done("BTC", "", "", 0)
 	})
 	for _, opt := range options {
 		opt := opt
 		list.AddItem(opt.name, opt.displayID, 0, func() {
-			a.pages.SwitchToPage("receive")
+			a.pages.SwitchToPage(returnPage)
 			done(opt.name, opt.assetIDHex, opt.groupKeyHex, opt.decimalDisplay)
 		})
 	}
 	list.SetBorder(true).SetTitle(" Select Asset (Esc=cancel) ")
 	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
-			a.pages.SwitchToPage("receive")
+			a.pages.SwitchToPage(returnPage)
 			done("", "", "", 0) // cancel: name=="" signals no selection
 			return nil
 		}
@@ -1646,21 +1646,59 @@ func (a *App) showPaymentDetail(e paymentEntry) {
 }
 
 func (a *App) showOpenChannel() {
+	var selectedAssetIDHex string
+	var settingFromPicker bool
+	var peerPubkey, localAmtStr, assetAmtStr, feeRateStr string
+
+	assetField := tview.NewInputField().
+		SetLabel("Asset").
+		SetFieldWidth(40).
+		SetPlaceholder("BTC  (press Enter to pick)")
+	assetField.SetChangedFunc(func(t string) {
+		if !settingFromPicker {
+			selectedAssetIDHex = t
+		}
+	})
+
 	form := tview.NewForm()
-
-	var peerPubkey, localAmtStr, assetID, assetAmtStr, feeRateStr string
-
 	form.
 		AddInputField("Peer pubkey (hex)", "", 66, nil, func(t string) { peerPubkey = t }).
-		AddInputField("Local BTC amount (sat)", "100000", 20, nil, func(t string) { localAmtStr = t }).
-		AddInputField("Asset ID (hex, optional)", "", 64, nil, func(t string) { assetID = t }).
+		AddFormItem(assetField).
 		AddInputField("Asset amount (if asset channel)", "", 20, nil, func(t string) { assetAmtStr = t }).
+		AddInputField("Local BTC amount (sat)", "100000", 20, nil, func(t string) { localAmtStr = t }).
 		AddInputField("Fee rate (sat/vbyte, optional)", "", 10, nil, func(t string) { feeRateStr = t }).
 		AddButton("Open", func() {
-			a.doOpenChannel(peerPubkey, localAmtStr, assetID, assetAmtStr, feeRateStr)
+			a.doOpenChannel(peerPubkey, localAmtStr, selectedAssetIDHex, assetAmtStr, feeRateStr)
 		})
 
 	form.SetBorder(true).SetTitle(" Open Channel ")
+
+	assetField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			a.showAssetPicker("openchan", func(name, assetIDHex, groupKeyHex string, _ uint32) {
+				if name == "" {
+					a.tapp.SetFocus(form)
+					return
+				}
+				settingFromPicker = true
+				if assetIDHex == "" && groupKeyHex == "" {
+					assetField.SetText("")
+				} else {
+					assetField.SetText(name)
+				}
+				settingFromPicker = false
+				selectedAssetIDHex = assetIDHex
+				a.tapp.SetFocus(form)
+			})
+			return nil
+		case tcell.KeyEscape:
+			a.showDashboard()
+			return nil
+		}
+		return event
+	})
+
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
