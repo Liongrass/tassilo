@@ -148,6 +148,7 @@ func (a *App) showDashboard() {
 	allAssets := assetList.GetAssets()
 	onchainGroups := buildOnchainAssetGroups(allAssets)
 	groupMetas := buildGroupMetaMap(allAssets)
+	addChannelAssetMetas(groupMetas, chanList.GetChannels())
 
 	offchainAssets := buildOffchainAssetText(aggregateAssetChannelBalances(chanList.GetChannels()), groupMetas)
 
@@ -271,6 +272,38 @@ func buildGroupMetaMap(assets []*taprpc.Asset) map[string]*groupMeta {
 		}
 	}
 	return m
+}
+
+// addChannelAssetMetas fills in metadata for group keys that only appear in
+// channels. ListAssets doesn't return assets that were never held on-chain by
+// this node (e.g. a channel funded by the peer), so without this those
+// channels would have no name or decimal display.
+func addChannelAssetMetas(m map[string]*groupMeta, channels []*lnrpc.Channel) {
+	for _, ch := range channels {
+		if len(ch.CustomChannelData) == 0 {
+			continue
+		}
+		var data jsonAssetChannel
+		if err := json.Unmarshal(ch.CustomChannelData, &data); err != nil || data.GroupKey == "" {
+			continue
+		}
+		if _, exists := m[data.GroupKey]; exists {
+			continue
+		}
+		gk, err := hexToBytes(data.GroupKey)
+		if err != nil {
+			continue
+		}
+		meta := &groupMeta{name: data.GroupKey[:min(12, len(data.GroupKey))], groupKey: gk}
+		if len(data.FundingAssets) > 0 {
+			fa := data.FundingAssets[0]
+			if fa.AssetGenesis.Name != "" {
+				meta.name = fa.AssetGenesis.Name
+			}
+			meta.decimalDisplay = uint32(fa.DecimalDisplay)
+		}
+		m[data.GroupKey] = meta
+	}
 }
 
 // resolveAssetPayReq decodes a bolt11 pay-req against all known group keys and
@@ -987,6 +1020,7 @@ func (a *App) showPaymentMethodPicker(payReq string) {
 	})
 
 	groupMetas := buildGroupMetaMap(assetList.GetAssets())
+	addChannelAssetMetas(groupMetas, chanList.GetChannels())
 	assetBals := aggregateAssetChannelBalances(chanList.GetChannels())
 
 	type entry struct {
@@ -1231,6 +1265,7 @@ func (a *App) showChannels() {
 		allAssets = al.GetAssets()
 	}
 	metaByKey := buildGroupMetaMap(allAssets)
+	addChannelAssetMetas(metaByKey, chResp.GetChannels())
 
 	type channelRow struct {
 		ch        *lnrpc.Channel
