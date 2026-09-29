@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"bytes"
+	"encoding/hex"
 	"testing"
 
 	taprpc "github.com/lightninglabs/taproot-assets/taprpc"
@@ -63,5 +65,25 @@ func TestBuildAssetIDInfoGroupDecimalFallback(t *testing.T) {
 		if info := byID[id]; info.dd != 6 || info.name != "USDT" {
 			t.Errorf("asset %s: got %+v, want {USDT 6}", id, info)
 		}
+	}
+}
+
+// Payments made by group key carry the x-only group key as a dummy asset ID.
+func TestBuildAssetIDInfoXOnlyGroupKey(t *testing.T) {
+	gk := append([]byte{0x03}, bytes.Repeat([]byte{0xcd}, 32)...)
+	assets := []*taprpc.Asset{{
+		AssetGenesis:   &taprpc.GenesisInfo{AssetId: []byte{0x01}, Name: "USDT"},
+		AssetGroup:     &taprpc.AssetGroup{TweakedGroupKey: gk},
+		DecimalDisplay: &taprpc.DecimalDisplay{DecimalDisplay: 6},
+	}}
+	byID := buildAssetIDInfo(assets, nil, buildGroupMetaMap(assets))
+
+	htlc := []byte(`{"balances":[{"asset_id":"` + hex.EncodeToString(gk[1:]) + `","amount":1234567}]}`)
+	name, amt, dd, ok := parsePaymentAsset([][]byte{htlc}, byID)
+	if !ok || name != "USDT" || amt != 1234567 || dd != 6 {
+		t.Errorf("got (%q, %d, %d, %v), want (USDT, 1234567, 6, true)", name, amt, dd, ok)
+	}
+	if got := formatAssetAmount(amt, dd); got != "1.234567" {
+		t.Errorf("formatted = %q, want 1.234567", got)
 	}
 }

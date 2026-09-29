@@ -1316,6 +1316,20 @@ func buildAssetIDInfo(assets []*taprpc.Asset, channels []*lnrpc.Channel,
 		}
 	}
 
+	// For payments made by group key, tapd puts the x-only group key (the
+	// compressed key without its 02/03 prefix) in the HTLC as a dummy asset
+	// ID. Register each group under that ID so those payments resolve too.
+	for key, meta := range metaByKey {
+		if len(meta.groupKey) != 33 {
+			continue
+		}
+		xOnly := fmt.Sprintf("%x", meta.groupKey[1:])
+		if _, exists := byID[xOnly]; !exists {
+			byID[xOnly] = assetInfo{name: meta.name}
+			groupOf[xOnly] = key
+		}
+	}
+
 	for id, info := range byID {
 		meta := metaByKey[groupOf[id]]
 		if meta == nil {
