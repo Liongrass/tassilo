@@ -1208,25 +1208,69 @@ func (a *App) doSendAsset(payReq, groupKeyHex string) {
 	}
 }
 
-// parsePaymentAsset tries to decode tapd's JSON-encoded asset payment data from
-// a Route or InvoiceHTLC CustomChannelData blob. On success it returns the
-// asset name, raw amount, decimal display, and true.
-func parsePaymentAsset(data []byte, metaByKey map[string]*groupMeta) (name string, amt uint64, dd uint32, ok bool) {
-	if len(data) == 0 {
-		return
-	}
-	var wrapper struct {
-		AssetAmounts map[string]uint64 `json:"asset_amounts"`
-	}
-	if err := json.Unmarshal(data, &wrapper); err != nil || len(wrapper.AssetAmounts) == 0 {
-		return
-	}
-	for key, amount := range wrapper.AssetAmounts {
-		if m, found := metaByKey[key]; found {
-			return m.name, amount, m.decimalDisplay, true
+// assetInfo is display metadata for a single asset ID.
+type assetInfo struct {
+	name string
+	dd   uint32
+}
+
+// jsonHtlc matches the JSON tapd's aux data parser puts into
+// Route.CustomChannelData and InvoiceHTLC.CustomChannelData (rfqmsg.JsonHtlc).
+type jsonHtlc struct {
+	Balances []struct {
+		AssetID string `json:"asset_id"`
+		Amount  uint64 `json:"amount"`
+	} `json:"balances"`
+}
+
+// parsePaymentAsset sums the asset amounts carried by the given HTLCs'
+// CustomChannelData blobs (one per HTLC, so multi-part payments are counted
+// in full). Asset IDs missing from byID are shown by a shortened asset ID.
+func parsePaymentAsset(htlcData [][]byte, byID map[string]assetInfo) (name string, amt uint64, dd uint32, ok bool) {
+	var firstID string
+	for _, data := range htlcData {
+		var h jsonHtlc
+		if err := json.Unmarshal(data, &h); err != nil {
+			continue
+		}
+		for _, b := range h.Balances {
+			amt += b.Amount
+			ok = true
+			if firstID == "" {
+				firstID = b.AssetID
+			}
+			if name == "" {
+				if info, found := byID[b.AssetID]; found {
+					name, dd = info.name, info.dd
+				}
+			}
 		}
 	}
+	if ok && name == "" {
+		name = firstID[:min(12, len(firstID))]
+	}
 	return
+}
+
+// addChannelAssetInfo adds asset-ID metadata from open channels' funding
+// assets, which covers assets this node never held on-chain.
+func addChannelAssetInfo(byID map[string]assetInfo, channels []*lnrpc.Channel) {
+	for _, ch := range channels {
+		if len(ch.CustomChannelData) == 0 {
+			continue
+		}
+		var data jsonAssetChannel
+		if err := json.Unmarshal(ch.CustomChannelData, &data); err != nil {
+			continue
+		}
+		for _, fa := range data.FundingAssets {
+			id := fa.AssetGenesis.AssetID
+			if _, exists := byID[id]; exists || id == "" || fa.AssetGenesis.Name == "" {
+				continue
+			}
+			byID[id] = assetInfo{name: fa.AssetGenesis.Name, dd: uint32(fa.DecimalDisplay)}
+		}
+	}
 }
 
 // paymentEntry is a unified record from any payment source.
@@ -1442,10 +1486,8 @@ func (a *App) showPayments() {
 
 	// Asset metadata — fetched once, reused for backfill.
 	var allAssets []*taprpc.Asset
-	assetIDToMeta := make(map[string]struct {
-		name string
-		dd   uint32
-	})
+	var channels []*lnrpc.Channel
+	assetIDToMeta := make(map[string]assetInfo)
 	func() {
 		ctx, cancel := newCtx()
 		defer cancel()
@@ -1467,13 +1509,19 @@ func (a *App) showPayments() {
 			if asset.DecimalDisplay != nil {
 				dd = asset.DecimalDisplay.DecimalDisplay
 			}
-			assetIDToMeta[key] = struct {
-				name string
-				dd   uint32
-			}{asset.AssetGenesis.Name, dd}
+			assetIDToMeta[key] = assetInfo{asset.AssetGenesis.Name, dd}
 		}
 	}()
+	func() {
+		ctx, cancel := newCtx()
+		defer cancel()
+		if resp, err := a.clients.LN.ListChannels(ctx, &lnrpc.ListChannelsRequest{}); err == nil {
+			channels = resp.GetChannels()
+		}
+	}()
+	addChannelAssetInfo(assetIDToMeta, channels)
 	metaByKey := buildGroupMetaMap(allAssets)
+	addChannelAssetMetas(metaByKey, channels)
 
 	var entries []paymentEntry
 	var lnOutOffset, lnInOffset uint64
@@ -1563,23 +1611,24 @@ func (a *App) showPayments() {
 				continue
 			}
 
-			var customData []byte
+			// Collect custom data from every successful HTLC so multi-part
+			// payments are summed in full.
+			var customData [][]byte
 			var payReq string
 
 			if e.kind == "ln_out" && e.lnOut != nil {
 				payReq = e.lnOut.PaymentRequest
 				for _, htlc := range e.lnOut.Htlcs {
-					if htlc.Status == lnrpc.HTLCAttempt_SUCCEEDED && htlc.Route != nil {
-						customData = htlc.Route.CustomChannelData
-						break
+					if htlc.Status == lnrpc.HTLCAttempt_SUCCEEDED && htlc.Route != nil &&
+						len(htlc.Route.CustomChannelData) > 0 {
+						customData = append(customData, htlc.Route.CustomChannelData)
 					}
 				}
 			} else if e.kind == "ln_in" && e.lnIn != nil {
 				payReq = e.lnIn.PaymentRequest
 				for _, htlc := range e.lnIn.Htlcs {
-					if htlc.State == lnrpc.InvoiceHTLCState_SETTLED {
-						customData = htlc.CustomChannelData
-						break
+					if htlc.State == lnrpc.InvoiceHTLCState_SETTLED && len(htlc.CustomChannelData) > 0 {
+						customData = append(customData, htlc.CustomChannelData)
 					}
 				}
 			}
@@ -1588,13 +1637,14 @@ func (a *App) showPayments() {
 				continue
 			}
 
-			// Try JSON (works if tapd serialises as JSON in future / different builds).
-			if name, amt, dd, found := parsePaymentAsset(customData, metaByKey); found {
+			// lnd runs tapd's aux data parser on these blobs, so they arrive
+			// as rfqmsg.JsonHtlc JSON.
+			if name, amt, dd, found := parsePaymentAsset(customData, assetIDToMeta); found {
 				e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
 				continue
 			}
 
-			// CustomChannelData is TLV — decode via DecodeAssetPayReq on the invoice.
+			// Fallback: decode the invoice against known group keys.
 			if name, amt, dd, found := a.resolveAssetPayReq(payReq, metaByKey); found {
 				e.assetName, e.amtAsset, e.decDisp, e.amtMsat = name, amt, dd, 0
 			} else {
