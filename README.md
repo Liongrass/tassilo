@@ -57,7 +57,7 @@ The dashboard shows your current balances (on-chain and off-chain, BTC and asset
 | Key | Action |
 |---|---|
 | `r` | Receive — create a BTC or asset invoice |
-| `s` | Send — pay a bolt11 or asset invoice |
+| `s` | Send — pay a bolt11 invoice, Lightning address or LNURL (BTC or assets) |
 | `p` | List payments — full payment history |
 | `c` | List channels — all BTC and asset channels |
 | `o` | Open channel — open a BTC or asset channel |

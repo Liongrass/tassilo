@@ -169,7 +169,7 @@ func (a *App) showDashboard() {
 
 	menu := tview.NewList().
 		AddItem("Receive — create invoice", "Create a taproot asset or BTC invoice", 'r', func() { a.showReceive() }).
-		AddItem("Send — pay invoice", "Pay a bolt11 or asset invoice", 's', func() { a.showSend() }).
+		AddItem("Send — pay invoice", "Pay an invoice, Lightning address or LNURL", 's', func() { a.showSend() }).
 		AddItem("List payments", "Show all incoming and outgoing payments", 'p', func() { a.showPayments() }).
 		AddItem("List channels", "Show all BTC and asset channels", 'c', func() { a.showChannels() }).
 		AddItem("Open channel", "Open a BTC or asset-denominated channel", 'o', func() { a.showOpenChannel() }).
@@ -805,18 +805,24 @@ func (a *App) showInvoicePage(payReq string) {
 
 func (a *App) showSend() {
 	form := tview.NewForm()
-	var payReqStr string
+	var destStr string
 
-	form.AddInputField("Payment Request (bolt11)", "", 0, nil, func(t string) { payReqStr = t }).
+	form.AddInputField("Invoice, Lightning address or LNURL", "", 0, nil, func(t string) { destStr = t }).
 		AddButton("Pay", func() {
-			if strings.TrimSpace(payReqStr) == "" {
-				a.showModal("Payment request is empty.", func() { a.showSend() })
+			dest := strings.TrimSpace(destStr)
+			if dest == "" {
+				a.showModal("Destination is empty.", func() { a.showSend() })
 				return
 			}
-			a.showPaymentMethodPicker(payReqStr)
+			switch kind := classifySendDest(dest); kind {
+			case sendDestLNURL, sendDestLightningAddress:
+				a.resolveLNURL(dest, kind)
+			default:
+				a.showPaymentMethodPicker(stripLightningPrefix(dest))
+			}
 		})
 
-	form.SetBorder(true).SetTitle(" Send — Pay Invoice ")
+	form.SetBorder(true).SetTitle(" Send ")
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
 			a.showDashboard()
@@ -825,6 +831,147 @@ func (a *App) showSend() {
 		return event
 	})
 	a.pages.AddAndSwitchToPage("send", form, true)
+}
+
+// showBusy shows a status page while work runs in the background. Esc
+// cancels the returned context and goes back to the send form.
+func (a *App) showBusy(msg string) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	tv := tview.NewTextView().
+		SetText(msg + "\n\n[grey]Esc to cancel[-]").
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+	tv.SetBorder(true)
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			cancel()
+			a.showSend()
+			return nil
+		}
+		return event
+	})
+	a.pages.AddAndSwitchToPage("busy", tv, true)
+	return ctx
+}
+
+// resolveLNURL fetches the LUD-06 payRequest for an LNURL or Lightning
+// Address and moves on to the amount form.
+func (a *App) resolveLNURL(dest string, kind sendDestKind) {
+	ctx := a.showBusy(fmt.Sprintf("Resolving %s …", dest))
+	go func() {
+		params, err := func() (*lnurlPayParams, error) {
+			target, err := lnurlParamsURL(dest, kind)
+			if err != nil {
+				return nil, err
+			}
+			return fetchLNURLPayParams(ctx, target)
+		}()
+		a.tapp.QueueUpdateDraw(func() {
+			if ctx.Err() != nil {
+				return // cancelled by the user
+			}
+			if err != nil {
+				a.showModal(fmt.Sprintf("LNURL error:\n%v", err), func() { a.showSend() })
+				return
+			}
+			a.showLNURLPay(dest, params)
+		})
+	}()
+}
+
+// showLNURLPay asks for the amount (and an optional LUD-12 comment) to send
+// to an LNURL-pay service, then fetches and verifies the invoice.
+func (a *App) showLNURLPay(dest string, params *lnurlPayParams) {
+	minSat := (params.minSendableMsat + 999) / 1000
+	maxSat := params.maxSendableMsat / 1000
+	if minSat > maxSat {
+		a.showModal("This LNURL only accepts sub-satoshi amounts.", func() { a.showSend() })
+		return
+	}
+
+	var amountStr, comment string
+	if minSat == maxSat {
+		amountStr = strconv.FormatInt(minSat, 10)
+	}
+
+	var info strings.Builder
+	info.WriteString(fmt.Sprintf("To:     [cyan]%s[-]\n", dest))
+	if params.description != "" {
+		info.WriteString(fmt.Sprintf("About:  %s\n", tview.Escape(params.description)))
+	}
+	info.WriteString(fmt.Sprintf("Range:  %s – %s sat", formatCommas(minSat), formatCommas(maxSat)))
+	infoView := tview.NewTextView().SetText(info.String()).SetDynamicColors(true).SetWordWrap(true)
+
+	form := tview.NewForm()
+	form.AddInputField("Amount (sat)", amountStr, 20, tview.InputFieldInteger, func(t string) { amountStr = t })
+	if params.commentAllowed > 0 {
+		form.AddInputField(fmt.Sprintf("Comment (max %d)", params.commentAllowed), "",
+			60, nil, func(t string) { comment = t })
+	}
+	form.AddButton("Continue", func() {
+		amt, err := strconv.ParseInt(strings.TrimSpace(amountStr), 10, 64)
+		if err != nil || amt < minSat || amt > maxSat {
+			a.showModal(fmt.Sprintf("Amount must be between %s and %s sat.",
+				formatCommas(minSat), formatCommas(maxSat)),
+				func() { a.showLNURLPay(dest, params) })
+			return
+		}
+		if params.commentAllowed > 0 && int64(len(comment)) > params.commentAllowed {
+			a.showModal(fmt.Sprintf("Comment must be at most %d characters.", params.commentAllowed),
+				func() { a.showLNURLPay(dest, params) })
+			return
+		}
+		a.fetchLNURLInvoice(dest, params, amt*1000, comment)
+	})
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.showSend()
+			return nil
+		}
+		return event
+	})
+
+	flex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(infoView, 4, 0, false).
+		AddItem(form, 0, 1, true)
+	flex.SetBorder(true).SetTitle(" Send — LNURL Pay ")
+	a.pages.AddAndSwitchToPage("lnurlpay", flex, true)
+}
+
+// fetchLNURLInvoice requests an invoice from the LNURL callback, verifies it
+// against the advertised metadata and requested amount, and hands it to the
+// regular payment method picker.
+func (a *App) fetchLNURLInvoice(dest string, params *lnurlPayParams, amountMsat int64, comment string) {
+	ctx := a.showBusy("Requesting invoice …")
+	go func() {
+		payReq, err := func() (string, error) {
+			pr, err := fetchLNURLInvoice(ctx, params, amountMsat, comment)
+			if err != nil {
+				return "", err
+			}
+			pr = stripLightningPrefix(pr)
+			decodeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			decoded, err := a.clients.LN.DecodePayReq(decodeCtx, &lnrpc.PayReqString{PayReq: pr})
+			if err != nil {
+				return "", fmt.Errorf("decode returned invoice: %w", err)
+			}
+			if err := verifyLNURLInvoice(decoded, params, amountMsat); err != nil {
+				return "", err
+			}
+			return pr, nil
+		}()
+		a.tapp.QueueUpdateDraw(func() {
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				a.showModal(fmt.Sprintf("LNURL error:\n%v", err), func() { a.showLNURLPay(dest, params) })
+				return
+			}
+			a.showPaymentMethodPicker(payReq)
+		})
+	}()
 }
 
 func (a *App) showPaymentMethodPicker(payReq string) {
