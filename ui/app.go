@@ -263,12 +263,13 @@ func buildGroupMetaMap(assets []*taprpc.Asset) map[string]*groupMeta {
 		} else {
 			key = fmt.Sprintf("%x", a.AssetGenesis.AssetId)
 		}
-		if _, exists := m[key]; !exists {
-			dd := uint32(0)
-			if a.DecimalDisplay != nil {
-				dd = a.DecimalDisplay.DecimalDisplay
-			}
+		dd := a.GetDecimalDisplay().GetDecimalDisplay()
+		if existing, exists := m[key]; !exists {
 			m[key] = &groupMeta{name: a.AssetGenesis.Name, decimalDisplay: dd, groupKey: gk}
+		} else if existing.decimalDisplay == 0 {
+			// Not every asset in a group reports a decimal display;
+			// keep the first one that does.
+			existing.decimalDisplay = dd
 		}
 	}
 	return m
@@ -287,7 +288,10 @@ func addChannelAssetMetas(m map[string]*groupMeta, channels []*lnrpc.Channel) {
 		if err := json.Unmarshal(ch.CustomChannelData, &data); err != nil || data.GroupKey == "" {
 			continue
 		}
-		if _, exists := m[data.GroupKey]; exists {
+		if existing, exists := m[data.GroupKey]; exists {
+			if existing.decimalDisplay == 0 && len(data.FundingAssets) > 0 {
+				existing.decimalDisplay = uint32(data.FundingAssets[0].DecimalDisplay)
+			}
 			continue
 		}
 		gk, err := hexToBytes(data.GroupKey)
@@ -328,9 +332,16 @@ func (a *App) resolveAssetPayReq(payReq string, metaByKey map[string]*groupMeta)
 		if resp.GenesisInfo != nil {
 			n = resp.GenesisInfo.Name
 		}
-		var d uint32
-		if resp.DecimalDisplay != nil {
-			d = resp.DecimalDisplay.DecimalDisplay
+		d := resp.GetDecimalDisplay().GetDecimalDisplay()
+		if d == 0 {
+			// Fall back to the group's (or ungrouped asset's) decimal display.
+			key := fmt.Sprintf("%x", resp.GetAssetGroup().GetTweakedGroupKey())
+			if len(resp.GetAssetGroup().GetTweakedGroupKey()) == 0 {
+				key = fmt.Sprintf("%x", resp.GetGenesisInfo().GetAssetId())
+			}
+			if meta, ok := metaByKey[key]; ok {
+				d = meta.decimalDisplay
+			}
 		}
 		// Require at least a name or a non-zero amount to consider it a match.
 		if n == "" && resp.AssetAmount == 0 {
@@ -1252,9 +1263,46 @@ func parsePaymentAsset(htlcData [][]byte, byID map[string]assetInfo) (name strin
 	return
 }
 
-// addChannelAssetInfo adds asset-ID metadata from open channels' funding
-// assets, which covers assets this node never held on-chain.
-func addChannelAssetInfo(byID map[string]assetInfo, channels []*lnrpc.Channel) {
+// buildAssetIDInfo returns asset-ID → {name, decimal display} for all assets
+// known from ListAssets and from open channels' funding assets (which covers
+// assets this node never held on-chain).
+//
+// Payments reference individual asset IDs, but tapd only reports a decimal
+// display for an asset whose own metadata carries it, so tranches of a
+// grouped asset can come back without one. A missing decimal display is
+// therefore filled in from the asset's group in metaByKey — the same source
+// the balance views use.
+func buildAssetIDInfo(assets []*taprpc.Asset, channels []*lnrpc.Channel,
+	metaByKey map[string]*groupMeta) map[string]assetInfo {
+
+	byID := make(map[string]assetInfo)
+	groupOf := make(map[string]string) // asset ID → group key hex
+	add := func(id, groupKey, name string, dd uint32) {
+		if id == "" {
+			return
+		}
+		info := byID[id]
+		if info.name == "" {
+			info.name = name
+		}
+		if info.dd == 0 {
+			info.dd = dd
+		}
+		byID[id] = info
+		if groupKey != "" {
+			groupOf[id] = groupKey
+		}
+	}
+
+	for _, asset := range assets {
+		var groupKey string
+		if asset.AssetGroup != nil && len(asset.AssetGroup.TweakedGroupKey) > 0 {
+			groupKey = fmt.Sprintf("%x", asset.AssetGroup.TweakedGroupKey)
+		}
+		add(fmt.Sprintf("%x", asset.AssetGenesis.AssetId), groupKey,
+			asset.AssetGenesis.Name, asset.GetDecimalDisplay().GetDecimalDisplay())
+	}
+
 	for _, ch := range channels {
 		if len(ch.CustomChannelData) == 0 {
 			continue
@@ -1264,13 +1312,24 @@ func addChannelAssetInfo(byID map[string]assetInfo, channels []*lnrpc.Channel) {
 			continue
 		}
 		for _, fa := range data.FundingAssets {
-			id := fa.AssetGenesis.AssetID
-			if _, exists := byID[id]; exists || id == "" || fa.AssetGenesis.Name == "" {
-				continue
-			}
-			byID[id] = assetInfo{name: fa.AssetGenesis.Name, dd: uint32(fa.DecimalDisplay)}
+			add(fa.AssetGenesis.AssetID, data.GroupKey, fa.AssetGenesis.Name, uint32(fa.DecimalDisplay))
 		}
 	}
+
+	for id, info := range byID {
+		meta := metaByKey[groupOf[id]]
+		if meta == nil {
+			continue
+		}
+		if info.dd == 0 {
+			info.dd = meta.decimalDisplay
+		}
+		if info.name == "" {
+			info.name = meta.name
+		}
+		byID[id] = info
+	}
+	return byID
 }
 
 // paymentEntry is a unified record from any payment source.
@@ -1487,7 +1546,6 @@ func (a *App) showPayments() {
 	// Asset metadata — fetched once, reused for backfill.
 	var allAssets []*taprpc.Asset
 	var channels []*lnrpc.Channel
-	assetIDToMeta := make(map[string]assetInfo)
 	func() {
 		ctx, cancel := newCtx()
 		defer cancel()
@@ -1496,20 +1554,8 @@ func (a *App) showPayments() {
 				Type: &taprpc.ScriptKeyTypeQuery_AllTypes{AllTypes: true},
 			},
 		})
-		if err != nil {
-			return
-		}
-		allAssets = al.GetAssets()
-		for _, asset := range allAssets {
-			key := fmt.Sprintf("%x", asset.AssetGenesis.AssetId)
-			if _, exists := assetIDToMeta[key]; exists {
-				continue
-			}
-			dd := uint32(0)
-			if asset.DecimalDisplay != nil {
-				dd = asset.DecimalDisplay.DecimalDisplay
-			}
-			assetIDToMeta[key] = assetInfo{asset.AssetGenesis.Name, dd}
+		if err == nil {
+			allAssets = al.GetAssets()
 		}
 	}()
 	func() {
@@ -1519,9 +1565,9 @@ func (a *App) showPayments() {
 			channels = resp.GetChannels()
 		}
 	}()
-	addChannelAssetInfo(assetIDToMeta, channels)
 	metaByKey := buildGroupMetaMap(allAssets)
 	addChannelAssetMetas(metaByKey, channels)
+	assetIDToMeta := buildAssetIDInfo(allAssets, channels, metaByKey)
 
 	var entries []paymentEntry
 	var lnOutOffset, lnInOffset uint64
