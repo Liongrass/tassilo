@@ -48,10 +48,16 @@ func Run(clients *client.Clients) error {
 	a.tapp.SetRoot(a.pages, true)
 	a.showDashboard()
 
-	// Ctrl+L forces a full redraw on any screen.
 	a.tapp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyCtrlL {
+		switch {
+		// Ctrl+L forces a full redraw on any screen.
+		case event.Key() == tcell.KeyCtrlL:
 			a.tapp.Sync()
+			return nil
+		// q quits from any screen, except while typing into a text field
+		// where it has to stay typeable.
+		case event.Key() == tcell.KeyRune && event.Rune() == 'q' && !a.textInputFocused():
+			a.tapp.Stop()
 			return nil
 		}
 		return event
@@ -98,6 +104,15 @@ func (a *App) loadInitialData() error {
 	}
 	a.nodeInfo = info
 	return nil
+}
+
+// textInputFocused reports whether the focused primitive accepts free text.
+func (a *App) textInputFocused() bool {
+	switch a.tapp.GetFocus().(type) {
+	case *tview.InputField, *tview.TextArea:
+		return true
+	}
+	return false
 }
 
 // withEsc wraps a primitive so that pressing Esc calls back.
@@ -175,7 +190,7 @@ func (a *App) showDashboard() {
 		AddItem("List channels", "Show all BTC and asset channels", 'c', func() { a.showChannels() }).
 		AddItem("Open channel", "Open a BTC or asset-denominated channel", 'o', func() { a.showOpenChannel() }).
 		AddItem("List assets", "Show all known taproot assets", 'a', func() { a.showAssets() }).
-		AddItem("Refresh", "Reload balances from node", 'f', func() {
+		AddItem("Refresh", "Reload balances from node", 'R', func() {
 			_ = a.loadInitialData()
 			a.showDashboard()
 		}).

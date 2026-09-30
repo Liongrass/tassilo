@@ -58,7 +58,7 @@ The dashboard shows your current balances (on-chain and off-chain, BTC and asset
 | `c` | List channels — all BTC and asset channels |
 | `o` | Open channel — open a BTC or asset channel |
 | `a` | List assets — all known Taproot Assets |
-| `f` | Refresh balances |
-| `q` | Quit |
+| `R` | Refresh balances |
+| `q` | Quit (from any screen, except while typing into a text field) |
 
 Press `Esc` in any view to return to the dashboard.
